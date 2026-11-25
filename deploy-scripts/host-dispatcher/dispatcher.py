@@ -366,27 +366,100 @@ def create_artifact(source_dir, commit):
     
     return artifact_path, hash_file
 
+def verify_trusted_path(path_str, description='path'):
+    """
+    验证可信路径安全性
+    
+    检查：
+    1. 文件存在且不是符号链接
+    2. 文件owner为root（生产模式）
+    3. 文件不可组写/他人写（mode & 0o022 == 0）
+    4. 父目录owner为root（生产模式）
+    5. 父目录不可组写/他人写
+    
+    非root测试模式跳过owner检查
+    """
+    path = Path(path_str)
+    
+    if not path.exists():
+        raise Exception('{} does not exist: {}'.format(description, path_str))
+    
+    # 检查符号链接
+    if path.is_symlink():
+        raise Exception('{} is a symlink (not allowed): {}'.format(description, path_str))
+    
+    # 检查路径规范化（防止 ../ 等路径穿越）
+    resolved = path.resolve()
+    if str(resolved) != str(path.absolute()):
+        raise Exception('{} contains path traversal: {} -> {}'.format(
+            description, path_str, resolved))
+    
+    # 获取文件stat
+    stat_info = path.stat()
+    
+    # Root模式：检查owner
+    if os.geteuid() == 0:
+        if stat_info.st_uid != 0:
+            raise Exception('{} not owned by root: uid={}'.format(
+                description, stat_info.st_uid))
+    
+    # 检查文件权限（所有模式）
+    if stat_info.st_mode & 0o022:
+        raise Exception('{} is group/world-writable: mode={:o}'.format(
+            description, stat_info.st_mode))
+    
+    # 检查父目录
+    parent = path.parent
+    parent_stat = parent.stat()
+    
+    # Root模式：检查父目录owner
+    if os.geteuid() == 0:
+        if parent_stat.st_uid != 0:
+            raise Exception('{} parent not owned by root: uid={}'.format(
+                description, parent_stat.st_uid))
+    
+    # 检查父目录权限（所有模式）
+    if parent_stat.st_mode & 0o022:
+        raise Exception('{} parent is group/world-writable: mode={:o}'.format(
+            description, parent_stat.st_mode))
+    
+    return True
+
 def execute_deploy(artifact_path, commit):
     """
     执行部署
     
     安全：
-    - 调用固定的 release.py（root 拥有）
-    - 不执行 repo 中的代码
+    - 生产：固定调用 /opt/inspect-deploy/bin/release.py
+    - 测试：允许RELEASE_CLI注入（非root）
+    - 验证可信路径（owner/mode/symlink/parent）
     """
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
     
-    # 固定的 release.py 路径（测试环境可覆盖）
-    release_py = CONFIG.get('release_cli', '/opt/inspect-platform/ops/release.py')
+    # 确定release路径：生产固定控制面，测试允许注入
+    is_root = os.geteuid() == 0
+    is_test_sandbox = 'RELEASE_ROOT' in CONFIG
     
-    if not Path(release_py).exists():
-        raise Exception('release.py 不存在: {}'.format(release_py))
+    if is_root and not is_test_sandbox:
+        # 生产模式：固定控制面，不可覆盖
+        release_py = Path('/opt/inspect-deploy/bin/release.py')
+        log('生产模式: 使用固定控制面 release.py')
+    else:
+        # 测试模式：允许env注入
+        release_py_str = os.environ.get('RELEASE_CLI') or CONFIG.get(
+            'release_cli', '/opt/inspect-deploy/bin/release.py')
+        release_py = Path(release_py_str)
+        log('测试模式: release_cli={}'.format(release_py))
+    
+    # 验证release路径安全性
+    verify_trusted_path(str(release_py), 'Control plane release.py')
+    log('release.py 安全验证通过: {}'.format(release_py))
     
     # 构建命令（测试环境不使用 sudo）
-    is_test_env = 'RELEASE_CLI' in os.environ or 'RELEASE_ROOT' in CONFIG
+    is_test_env = not is_root or is_test_sandbox
     python_cmd = sys.executable if is_test_env else '/usr/bin/python3'
-    use_sudo = not is_test_env
+    use_sudo = is_root and not is_test_sandbox
     
     # 测试环境变量
     cmd_env = os.environ.copy()
@@ -408,7 +481,7 @@ def execute_deploy(artifact_path, commit):
         cmd.extend(['sudo', python_cmd])
     else:
         cmd.append(python_cmd)
-    cmd.extend([release_py, 'prepare', str(artifact_path), version])
+    cmd.extend([str(release_py), 'prepare', str(artifact_path), version])
     
     # Python 3.6 兼容
     proc = subprocess.Popen(
@@ -433,7 +506,7 @@ def execute_deploy(artifact_path, commit):
         cmd.extend(['sudo', python_cmd])
     else:
         cmd.append(python_cmd)
-    cmd.extend([release_py, 'deploy', version])
+    cmd.extend([str(release_py), 'deploy', version])
     
     proc = subprocess.Popen(
         cmd,
