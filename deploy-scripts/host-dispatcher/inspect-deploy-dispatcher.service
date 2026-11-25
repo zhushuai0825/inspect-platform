@@ -1,0 +1,23 @@
+[Unit]
+Description=Inspect Platform Deploy Dispatcher
+Documentation=https://github.com/zhushuai0825/inspect-platform
+After=network.target docker.service inspect-platform.service
+Requires=inspect-platform.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/inspect-deploy
+ExecStart=/usr/bin/python3 /opt/inspect-deploy/dispatcher.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=false
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

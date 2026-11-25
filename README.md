@@ -56,19 +56,19 @@ ssh -N -L 18766:127.0.0.1:8766 root@8.146.206.64
 本项目已接入 GitHub 版本管理和 Jenkins 自动化部署：
 
 - **仓库**：https://github.com/zhushuai0825/inspect-platform
-- **PR 测试**：GitHub Actions 自动运行 67 项测试（隔离环境）
-- **main 部署**：Jenkins Freestyle Job 自动部署到生产服务器
-  - 隔离测试容器（无生产挂载、无 Docker socket、384MB 限额）
-  - 固定部署脚本（宿主机，不受 repo 控制）
+- **Main 分支**：Jenkins 自动测试 + 部署
+  - 固定脚本控制（不受 repo 控制）
+  - 隔离测试容器（独立网络，384MB 限额）
+  - Spool 触发宿主 dispatcher
   - 健康检查 + 自动回滚
-- **安全隔离**：控制器不执行任何仓库代码，所有构建在固定脚本控制下进行
+- **PR 执行**：本里程碑明确禁用（资源和安全限制）
 
-**架构说明**：
-- Jenkins 容器：root (uid=0)，挂载生产目录和 Docker socket
-- 控制器 2 执行器，无 agent/cloud
-- 资源限制：809MB 可用，测试容器 384MB 限额
-- 不使用 Pipeline（Freestyle Job + 固定脚本）
+**架构**：
+- Jenkins 容器：root (uid=0)，Docker socket，挂载生产目录
+- 固定脚本：Jenkins 容器内 + 宿主 dispatcher
+- 测试：隔离 Docker 容器，只读 repo
+- 部署：Spool 触发，分支验证，制品校验
 
-详细架构见 [`JENKINS-ARCHITECTURE.md`](JENKINS-ARCHITECTURE.md)。
+详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 和 [`DEPLOY-GUIDE.md`](DEPLOY-GUIDE.md)。
 
 邮件已于2026-11-25 14:28:18（Asia/Shanghai）按用户授权启用，使用同一获授权账号收发，仅通知未来新故障及其恢复，不补发历史。未发测试信，不能据认证成功宣称邮件已送达。详情见 MAIL-ACTIVATION.md。
