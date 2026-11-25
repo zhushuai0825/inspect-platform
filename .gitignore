@@ -1,0 +1,11 @@
+data/
+*.db
+*.db-*
+*.env
+.env*
+*.sock
+__pycache__/
+*.pyc
+*.pyo
+*.tar.gz
+*.zip

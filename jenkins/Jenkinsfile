@@ -1,0 +1,53 @@
+// Daily HTTP Smoke Test Job (site-http-smoke)
+// This is SEPARATE from the CI/CD pipeline in the root Jenkinsfile.
+// This job runs the actual inspection tasks on schedule and manual triggers.
+
+pipeline {
+  agent any
+  
+  options {
+    timeout(time: 10, unit: 'MINUTES')
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '40'))
+  }
+  
+  parameters {
+    string(name: 'TRIGGER', defaultValue: 'jenkins', description: 'manual / schedule / jenkins')
+  }
+  
+  triggers {
+    // Daily at 09:00 Asia/Shanghai
+    cron('TZ=Asia/Shanghai\n0 9 * * *')
+  }
+  
+  environment {
+    TZ = 'Asia/Shanghai'
+  }
+  
+  stages {
+    stage('HTTP 冒烟巡检') {
+      steps {
+        script {
+          def timers = currentBuild.getBuildCauses('hudson.triggers.TimerTrigger')
+          env.INSPECT_TRIGGER = timers ? 'schedule' : (params.TRIGGER == 'manual' ? 'manual' : 'jenkins')
+        }
+        
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          export TRIGGER="$INSPECT_TRIGGER"
+          bash /opt/inspect-platform/inspect_run.sh
+        '''
+      }
+    }
+  }
+  
+  post {
+    failure {
+      echo '巡检失败：详细状态码、断言与错误日志见巡检平台。'
+    }
+    always {
+      echo '报告与事件：http://8.146.206.64/qa/'
+    }
+  }
+}

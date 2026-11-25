@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# 安装 Git（测试必需）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+# 验证依赖
+RUN python3 --version && \
+    git --version
+
+# 设置工作目录
+WORKDIR /workspace
+
+# 拷贝源码
+COPY . .
+
+# 启动检查依赖
+RUN python3 -c "import sys; print('Python', sys.version)" && \
+    git --version && \
+    echo "✓ Dependencies verified"
+
+# 默认命令：运行测试
+CMD ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"]

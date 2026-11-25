@@ -1,0 +1,20 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>任务配置 · 本机管理</title><link rel="stylesheet" href="/styles.css?v=3"><link rel="stylesheet" href="/admin.css?v=3"></head><body>
+<div class="shell"><aside class="sidebar"><a href="/" class="brand"><span class="brand-mark">Q</span><span>任务配置<small>LOCAL ADMINISTRATION</small></span></a><div class="nav-label">受保护的配置入口</div><nav><a href="/" class="active"><span class="nav-symbol">01</span>巡检配置</a></nav><div class="sidebar-bottom"><a href="http://8.146.206.64/qa/" target="_blank" rel="noopener">打开公开看板 ↗</a><div>仅监听本机 · SSH 隧道访问</div></div></aside>
+<div class="workspace"><header class="topbar"><div class="breadcrumb">质量管理 <span>/</span> <strong>巡检配置</strong></div><span class="access-badge">本机管理 · SSH 隧道</span></header><main>
+<div class="page-header"><div><h1>巡检配置</h1><p>配置保存后，从下一次 Jenkins 巡检生效；已有报告与快照不会改变。</p></div><div class="actions"><button id="reload" class="button">刷新</button><button id="create" class="button primary">新建检查</button></div></div>
+<div class="notice">此管理端只在服务器本机监听，通过 SSH 隧道使用，不需要新增网站密码。目标地址和断言会显示在公开看板，请勿填写口令、令牌等敏感信息。</div>
+<div id="message" class="notice hidden" role="status"></div>
+<section class="panel"><div class="panel-head"><h2>检查配置</h2><span class="muted" id="count"></span></div><div class="table-wrap"><table><thead><tr><th>名称 / 标识</th><th>请求目标</th><th>方法</th><th>状态码</th><th>超时</th><th>状态</th><th>操作</th></tr></thead><tbody id="tasks"><tr><td colspan="7" class="empty">正在读取配置…</td></tr></tbody></table></div></section>
+<div class="notice">安全限制：仅 GET / HEAD，HTTP 80 或 HTTPS 443；不支持查询参数、URL 凭证及自定义请求头；不跟随重定向。禁止内网、回环、保留和云元数据地址。系统内置项的地址固定，可调整其他检查规则或启停。</div>
+<section id="editor" class="panel hidden"><div class="panel-head"><h2 id="editor-title">新建检查</h2><button class="button small" id="cancel">取消</button></div><form id="task-form" class="editor-form">
+<label>检查名称 <input name="name" maxlength="80" required placeholder="例如：官网健康检查"></label>
+<label class="wide">请求地址 <input name="url" type="url" maxlength="2048" required placeholder="https://example.com/health"><span class="muted" id="url-help">只支持公开 HTTP(S) 目标，不允许查询参数或敏感信息。</span></label>
+<label>请求方法 <select name="method"><option>GET</option><option>HEAD</option></select></label>
+<label>预期状态码 <input name="codes" required value="200" placeholder="200, 204"><span class="muted">200–599，最多 8 个，用逗号分隔。</span></label>
+<label>超时（秒） <input name="timeout" type="number" min="1" max="15" step="1" value="10" required></label>
+<label class="wide">响应内容断言（可选）<textarea name="contains" maxlength="500" rows="3" placeholder="GET 响应正文需包含的固定文本，最多 500 字符"></textarea></label>
+<label class="checkbox"><input name="enabled" type="checkbox" checked> 启用此检查</label>
+<div class="wide form-actions"><button id="save" type="submit" class="button primary">保存配置</button><span class="muted">最多 30 项，最多启用 15 项，启用项超时总预算 ≤ 120 秒。</span></div>
+</form></section>
+<footer class="main-footer"><span>本机任务配置 · 不提供删除或任意命令执行</span><span>配置持久化存储于 SQLite</span></footer>
+</main></div></div><script src="/app.js?v=3"></script></body></html>
