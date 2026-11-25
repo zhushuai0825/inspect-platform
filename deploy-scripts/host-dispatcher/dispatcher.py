@@ -366,62 +366,97 @@ def create_artifact(source_dir, commit):
     
     return artifact_path, hash_file
 
-def verify_trusted_path(path_str, description='path'):
+def verify_trusted_path(path_str, description='path', check_ancestors=True):
     """
     验证可信路径安全性
     
     检查：
     1. 文件存在且不是符号链接
-    2. 文件owner为root（生产模式）
+    2. 文件owner为root（root模式）
     3. 文件不可组写/他人写（mode & 0o022 == 0）
-    4. 父目录owner为root（生产模式）
-    5. 父目录不可组写/他人写
+    4. 完整祖先链（到根或受保护锚点）：
+       - 每个祖先不是符号链接
+       - 每个祖先owner为root（root模式）
+       - 每个祖先不可组写/他人写
     
-    非root测试模式跳过owner检查
+    非root测试模式：
+    - 跳过owner检查
+    - 保留权限检查
+    - 允许受保护锚点内的路径（如测试临时目录）
     """
-    path = Path(path_str)
+    path = Path(path_str).resolve()
+    is_root_mode = os.geteuid() == 0
     
     if not path.exists():
         raise Exception('{} does not exist: {}'.format(description, path_str))
     
-    # 检查符号链接
-    if path.is_symlink():
+    # 检查文件本身不是符号链接（在resolve前的原始路径）
+    orig_path = Path(path_str)
+    if orig_path.is_symlink():
         raise Exception('{} is a symlink (not allowed): {}'.format(description, path_str))
     
     # 检查路径规范化（防止 ../ 等路径穿越）
-    resolved = path.resolve()
-    if str(resolved) != str(path.absolute()):
+    if str(path) != str(orig_path.absolute()):
         raise Exception('{} contains path traversal: {} -> {}'.format(
-            description, path_str, resolved))
+            description, path_str, path))
     
-    # 获取文件stat
+    # 验证文件本身
     stat_info = path.stat()
     
-    # Root模式：检查owner
-    if os.geteuid() == 0:
-        if stat_info.st_uid != 0:
-            raise Exception('{} not owned by root: uid={}'.format(
-                description, stat_info.st_uid))
+    if is_root_mode and stat_info.st_uid != 0:
+        raise Exception('{} not owned by root: uid={}'.format(
+            description, stat_info.st_uid))
     
-    # 检查文件权限（所有模式）
     if stat_info.st_mode & 0o022:
         raise Exception('{} is group/world-writable: mode={:o}'.format(
             description, stat_info.st_mode))
     
-    # 检查父目录
-    parent = path.parent
-    parent_stat = parent.stat()
-    
-    # Root模式：检查父目录owner
-    if os.geteuid() == 0:
-        if parent_stat.st_uid != 0:
-            raise Exception('{} parent not owned by root: uid={}'.format(
-                description, parent_stat.st_uid))
-    
-    # 检查父目录权限（所有模式）
-    if parent_stat.st_mode & 0o022:
-        raise Exception('{} parent is group/world-writable: mode={:o}'.format(
-            description, parent_stat.st_mode))
+    # 验证完整祖先链
+    if check_ancestors:
+        current = path.parent
+        ancestors_checked = 0
+        
+        # 受保护锚点：停止祖先检查的边界
+        # Root模式：检查到根目录
+        # 非root测试：检查到测试目录顶层（不检查/tmp等系统目录）
+        protected_anchors = []
+        if not is_root_mode:
+            # 非root测试：识别测试目录顶层作为受保护锚点
+            # 检查路径是否在/tmp下的测试目录中
+            path_str = str(path)
+            if path_str.startswith('/tmp/'):
+                # 找到/tmp下的第一级目录（如 /tmp/test_dispatcher_xxx）
+                parts = path_str.split('/')
+                if len(parts) >= 3:  # ['', 'tmp', 'test_xxx', ...]
+                    protected_anchors.append(Path('/' + parts[1] + '/' + parts[2]))
+        
+        while current != current.parent:  # 未到根目录
+            ancestors_checked += 1
+            if ancestors_checked > 100:  # 防止无限循环
+                raise Exception('{} ancestor chain too deep'.format(description))
+            
+            # 检查到受保护锚点则停止（不检查锚点本身）
+            if current in protected_anchors:
+                break
+            
+            # 检查祖先不是符号链接
+            if current.is_symlink():
+                raise Exception('{} ancestor is symlink: {}'.format(description, current))
+            
+            # 检查祖先stat
+            ancestor_stat = current.stat()
+            
+            # Root模式：检查祖先owner
+            if is_root_mode and ancestor_stat.st_uid != 0:
+                raise Exception('{} ancestor not root-owned: {} (uid={})'.format(
+                    description, current, ancestor_stat.st_uid))
+            
+            # 检查祖先权限（所有模式）
+            if ancestor_stat.st_mode & 0o022:
+                raise Exception('{} ancestor group/world-writable: {} (mode={:o})'.format(
+                    description, current, ancestor_stat.st_mode))
+            
+            current = current.parent
     
     return True
 
@@ -437,29 +472,28 @@ def execute_deploy(artifact_path, commit):
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
     
-    # 确定release路径：生产固定控制面，测试允许注入
-    is_root = os.geteuid() == 0
-    is_test_sandbox = 'RELEASE_ROOT' in CONFIG
-    
-    if is_root and not is_test_sandbox:
-        # 生产模式：固定控制面，不可覆盖
+    # 确定release路径：root无条件固定控制面，非root允许沙盒注入
+    if os.geteuid() == 0:
+        # Root生产：固定控制面，绝不允许CONFIG/env覆盖
         release_py = Path('/opt/inspect-deploy/bin/release.py')
-        log('生产模式: 使用固定控制面 release.py')
+        log('Root模式: 固定控制面 /opt/inspect-deploy/bin/release.py')
     else:
-        # 测试模式：允许env注入
-        release_py_str = os.environ.get('RELEASE_CLI') or CONFIG.get(
-            'release_cli', '/opt/inspect-deploy/bin/release.py')
+        # 非root测试沙盒：允许明确的RELEASE_CLI env注入
+        # 不允许任意注入：必须显式设置RELEASE_CLI
+        release_py_str = os.environ.get('RELEASE_CLI')
+        if not release_py_str:
+            raise Exception('Non-root mode requires explicit RELEASE_CLI env')
         release_py = Path(release_py_str)
-        log('测试模式: release_cli={}'.format(release_py))
+        log('非root测试模式: RELEASE_CLI={}'.format(release_py))
     
     # 验证release路径安全性
     verify_trusted_path(str(release_py), 'Control plane release.py')
     log('release.py 安全验证通过: {}'.format(release_py))
     
-    # 构建命令（测试环境不使用 sudo）
-    is_test_env = not is_root or is_test_sandbox
-    python_cmd = sys.executable if is_test_env else '/usr/bin/python3'
-    use_sudo = is_root and not is_test_sandbox
+    # 构建命令（非root测试环境不使用 sudo）
+    is_root_mode = os.geteuid() == 0
+    python_cmd = sys.executable if not is_root_mode else '/usr/bin/python3'
+    use_sudo = is_root_mode
     
     # 测试环境变量
     cmd_env = os.environ.copy()
@@ -473,8 +507,8 @@ def execute_deploy(artifact_path, commit):
         cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
     
     # Prepare
-    log('执行: prepare (env={})'.format('test' if is_test_env else 'prod'))
-    if is_test_env:
+    log('执行: prepare (env={})'.format('test' if not is_root_mode else 'prod'))
+    if not is_root_mode:
         log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
     cmd = []
     if use_sudo:
@@ -500,7 +534,7 @@ def execute_deploy(artifact_path, commit):
     log('prepare 成功: {}'.format(stdout[:200]))
     
     # Deploy
-    log('执行: deploy (env={})'.format('test' if is_test_env else 'prod'))
+    log('执行: deploy (env={})'.format('test' if not is_root_mode else 'prod'))
     cmd = []
     if use_sudo:
         cmd.extend(['sudo', python_cmd])

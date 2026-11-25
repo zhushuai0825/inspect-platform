@@ -111,11 +111,15 @@ class Manager:
         if not runner_path.exists():
             raise ReleaseError('PREFLIGHT_RUNNER_MISSING')
         
-        # 验证runner安全性
+        # 验证runner安全性：文件及父目录
         # 生产（root）：owner必须是root（uid=0）
         # 测试（非root）：owner检查放宽（允许当前用户）
         # mode始终不可组写(020)或他人写(002)
         try:
+            # 检查文件不是符号链接
+            if runner_path.is_symlink():
+                raise ReleaseError('PREFLIGHT_RUNNER_IS_SYMLINK')
+            
             stat_info = runner_path.stat()
             
             # Owner检查
@@ -131,6 +135,18 @@ class Manager:
             # Mode检查（生产和测试都要求）
             if stat_info.st_mode & 0o022:  # 检查组写(020)或他人写(002)
                 raise ReleaseError('PREFLIGHT_RUNNER_WORLD_WRITABLE')
+            
+            # 检查父目录
+            parent = runner_path.parent
+            parent_stat = parent.stat()
+            
+            if os.geteuid() == 0:
+                if parent_stat.st_uid != 0:
+                    raise ReleaseError('PREFLIGHT_RUNNER_PARENT_NOT_ROOT_OWNED')
+            
+            if parent_stat.st_mode & 0o022:
+                raise ReleaseError('PREFLIGHT_RUNNER_PARENT_WORLD_WRITABLE')
+                
         except OSError as e:
             raise ReleaseError('PREFLIGHT_RUNNER_STAT_FAILED')
         
