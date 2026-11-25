@@ -39,18 +39,37 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    """加载配置"""
+    """加载配置（支持环境变量覆盖）"""
+    config = DEFAULT_CONFIG.copy()
+    
+    # 从配置文件加载
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
-            config = json.load(f)
-        # 合并默认配置
-        return {**DEFAULT_CONFIG, **config}
-    return DEFAULT_CONFIG
+            file_config = json.load(f)
+        config.update(file_config)
+    
+    # 环境变量覆盖（用于测试）
+    if 'GITHUB_REPO' in os.environ:
+        config['repo_url'] = os.environ['GITHUB_REPO']
+    if 'GITHUB_BRANCH' in os.environ:
+        config['branch'] = os.environ['GITHUB_BRANCH']
+    if 'SPOOL_DIR' in os.environ:
+        config['spool_dir'] = os.environ['SPOOL_DIR']
+    if 'WORK_DIR' in os.environ:
+        config['work_dir'] = os.environ['WORK_DIR']
+    if 'RELEASE_CLI' in os.environ:
+        config['release_cli'] = os.environ['RELEASE_CLI']
+    if 'RELEASE_ROOT' in os.environ:
+        config['release_root'] = os.environ['RELEASE_ROOT']
+    if 'RELEASE_STATE' in os.environ:
+        config['release_state'] = os.environ['RELEASE_STATE']
+    
+    return config
 
 CONFIG = load_config()
 SPOOL = Path(CONFIG['spool_dir'])
 WORK_DIR = Path(CONFIG['work_dir'])
-LOG_FILE = Path(CONFIG['log_file'])
+LOG_FILE = Path(CONFIG.get('log_file', '/tmp/dispatcher.log'))
 
 def log(msg):
     """写日志（Python 3.6 兼容）"""
@@ -342,38 +361,77 @@ def execute_deploy(artifact_path, commit):
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
     
-    # 固定的 release.py 路径
-    release_py = '/opt/inspect-platform/ops/release.py'
+    # 固定的 release.py 路径（测试环境可覆盖）
+    release_py = CONFIG.get('release_cli', '/opt/inspect-platform/ops/release.py')
     
     if not Path(release_py).exists():
         raise Exception('release.py 不存在: {}'.format(release_py))
     
+    # 构建命令（测试环境不使用 sudo）
+    is_test_env = 'RELEASE_CLI' in os.environ or 'RELEASE_ROOT' in CONFIG
+    python_cmd = sys.executable if is_test_env else '/usr/bin/python3'
+    use_sudo = not is_test_env
+    
+    # 测试环境变量
+    cmd_env = os.environ.copy()
+    if 'release_root' in CONFIG:
+        cmd_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(
+            CONFIG['release_root'],
+            CONFIG['release_state']
+        )
+        cmd_env['RELEASE_TEST_SKIP_PREFLIGHT'] = '1'
+        cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
+    
     # Prepare
-    log('执行: prepare')
-    cmd = ['sudo', '/usr/bin/python3', release_py, 'prepare', str(artifact_path), version]
+    log('执行: prepare (env={})'.format('test' if is_test_env else 'prod'))
+    if is_test_env:
+        log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
+    cmd = []
+    if use_sudo:
+        cmd.extend(['sudo', python_cmd])
+    else:
+        cmd.append(python_cmd)
+    cmd.extend([release_py, 'prepare', str(artifact_path), version])
     
     # Python 3.6 兼容
-    if PYTHON36_COMPAT:
-        returncode, stdout, stderr = run_command(cmd, timeout=300)
-    else:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=cmd_env
+    )
+    stdout, stderr = proc.communicate(timeout=300)
     
-    if returncode != 0:
+    if proc.returncode != 0:
+        log('prepare 失败: stdout={} stderr={}'.format(stdout, stderr))
         raise Exception('prepare 失败: {}'.format(stderr))
     
+    log('prepare 成功: {}'.format(stdout[:200]))
+    
     # Deploy
-    log('执行: deploy')
-    cmd = ['sudo', '/usr/bin/python3', release_py, 'deploy', version]
-    
-    if PYTHON36_COMPAT:
-        returncode, stdout, stderr = run_command(cmd, timeout=600)
+    log('执行: deploy (env={})'.format('test' if is_test_env else 'prod'))
+    cmd = []
+    if use_sudo:
+        cmd.extend(['sudo', python_cmd])
     else:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        cmd.append(python_cmd)
+    cmd.extend([release_py, 'deploy', version])
     
-    if returncode != 0:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=cmd_env
+    )
+    stdout, stderr = proc.communicate(timeout=600)
+    
+    if proc.returncode != 0:
+        log('deploy 失败: stdout={} stderr={}'.format(stdout, stderr))
         raise Exception('deploy 失败: {}'.format(stderr))
+    
+    log('deploy 成功: {}'.format(stdout[:200]))
     
     log('✓ 部署成功: {}'.format(version))
     return version
@@ -576,8 +634,13 @@ def process_request(req_file):
 
 def main():
     """主循环"""
+    # 解析参数
+    once_mode = '--once' in sys.argv
+    
     log('=' * 60)
     log('Inspect Deploy Dispatcher 启动')
+    if once_mode:
+        log('模式: 单次处理（--once）')
     log('配置:')
     log('  Repo: {}'.format(CONFIG['repo_url']))
     log('  Branch: {}'.format(CONFIG['branch']))
@@ -599,13 +662,25 @@ def main():
     while True:
         try:
             # 扫描请求文件
-            requests = sorted(SPOOL.glob('request-*.json'))
+            requests = sorted(SPOOL.glob('*.json'))
+            # 过滤：只处理 request-*.json 或 test-req-*.json
+            requests = [r for r in requests if r.name.startswith('request-') or r.name.startswith('test-req-')]
             
+            processed_any = False
             for req_file in requests:
                 try:
                     process_request(req_file)
+                    processed_any = True
                 except Exception as e:
                     log('处理请求异常: {}'.format(e))
+            
+            # 单次模式：处理完一轮后退出
+            if once_mode:
+                if processed_any:
+                    log('单次处理完成，退出')
+                else:
+                    log('未发现待处理请求，退出')
+                break
             
             # 清理旧文件（超过 1 小时）
             cutoff = time.time() - 3600
@@ -625,6 +700,8 @@ def main():
             
         except Exception as e:
             log('主循环错误: {}'.format(e))
+            if once_mode:
+                sys.exit(1)
         
         time.sleep(2)
 
