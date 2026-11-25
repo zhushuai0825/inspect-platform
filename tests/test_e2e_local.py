@@ -61,10 +61,12 @@ class TestE2ELocal(unittest.TestCase):
         script = Path(__file__).parent.parent / 'deploy-scripts' / 'jenkins' / 'notify-deploy.sh'
         
         # 无效 commit（短）
+        # Python 3.6 兼容：使用 stdout/stderr=PIPE, universal_newlines=True
         result = subprocess.run(
             ['bash', str(script), 'invalid'],
-            capture_output=True,
-            text=True
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
         )
         
         # 应拒绝
@@ -74,8 +76,9 @@ class TestE2ELocal(unittest.TestCase):
         # 无效 commit（非 hex）
         result = subprocess.run(
             ['bash', str(script), 'x' * 40],
-            capture_output=True,
-            text=True
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
         )
         
         # 应拒绝

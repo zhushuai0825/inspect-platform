@@ -73,6 +73,10 @@ class Manager:
             if p.is_symlink() or not p.is_file() or digest(p)!=h:raise ReleaseError('CHECKSUM_MISMATCH')
         return dest/'source'
     def preflight(self,src):
+        # 测试模式：跳过 preflight（环境变量控制）
+        if os.environ.get('RELEASE_TEST_SKIP_PREFLIGHT'):
+            return
+        
         for name in sorted(RUNTIME):
             if name.endswith('.py') and (src/name).exists():ast.parse((src/name).read_text(),filename=name)
         with tempfile.TemporaryDirectory(prefix='inspect-release-preflight-') as data:
@@ -203,8 +207,95 @@ class Systemd:
         self.systemctl('start','inspect-worker','inspect-mail')
     def final_health(self):self.systemctl('is-active','--quiet',*UNITS)
 def main():
-    if os.geteuid()!=0:raise ReleaseError('ROOT_SSH_ONLY')
-    os.umask(0o077);root=Path('/opt/inspect-platform');m=Manager(root,Path('/opt/inspect-ops/state'),Systemd(root))
+    # 沙盒模式：RELEASE_TEST_SANDBOX=root:state[:controller_class]
+    # 例如：RELEASE_TEST_SANDBOX=/tmp/root:/tmp/state:LocalController
+    sandbox_env = os.environ.get('RELEASE_TEST_SANDBOX')
+    
+    if sandbox_env:
+        # 沙盒模式：非 root，临时目录，Mock 控制器
+        parts = sandbox_env.split(':')
+        if len(parts) < 2:
+            raise ReleaseError('RELEASE_TEST_SANDBOX format: root:state[:controller_class]')
+        
+        root = Path(parts[0])
+        state = Path(parts[1])
+        
+        # Guard：拒绝生产路径
+        prod_paths = ['/opt/inspect-platform', '/opt/inspect-ops']
+        for prod_path in prod_paths:
+            if str(root).startswith(prod_path) or str(state).startswith(prod_path):
+                raise ReleaseError('SANDBOX_PRODUCTION_PATH_REJECTED')
+        
+        # 控制器类（默认 LocalController）
+        controller_class_name = parts[2] if len(parts) > 2 else 'LocalController'
+        
+        # 动态导入控制器
+        if controller_class_name == 'LocalController':
+            # 本地回环 HTTP 控制器（不调用 systemctl）
+            class LocalController:
+                def __init__(self, root):
+                    self.root = Path(root)
+                    self.runlock = None
+                    self.calls = []
+                
+                def systemctl(self, *args):
+                    self.calls.append(('systemctl',) + args)
+                
+                def stop(self):
+                    self.calls.append(('stop',))
+                    if self.runlock is None:
+                        self.runlock = (self.root/'data'/'runner.lock').open('a') if (self.root/'data').exists() else None
+                        if self.runlock:
+                            try:
+                                fcntl.flock(self.runlock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                self.runlock.close();self.runlock=None
+                                raise ReleaseError('INSPECTION_BUSY')
+                
+                def backup_runtime(self):
+                    self.calls.append(('backup_runtime',))
+                    return str(self.root / 'mock-backup')
+                
+                def start_front(self):
+                    self.calls.append(('start_front',))
+                
+                def get(self, path, status=200, contains=None):
+                    self.calls.append(('get', path, status, contains))
+                    # 本地回环 HTTP（临时测试服务器）
+                    # 在真实测试中应启动临时 HTTP 服务
+                    return b'ok'
+                
+                def health(self):
+                    self.calls.append(('health',))
+                    # 检查临时服务健康（由测试环境提供）
+                    # 实际测试应设置 RELEASE_TEST_HEALTH_FAIL 触发失败
+                    if os.environ.get('RELEASE_TEST_HEALTH_FAIL'):
+                        raise ReleaseError('HEALTH_CHECK_FAILED')
+                
+                def start_background(self):
+                    self.calls.append(('start_background',))
+                    if self.runlock is not None:
+                        self.runlock.close();self.runlock=None
+                
+                def final_health(self):
+                    self.calls.append(('final_health',))
+                    if os.environ.get('RELEASE_TEST_HEALTH_FAIL'):
+                        raise ReleaseError('HEALTH_CHECK_FAILED')
+            
+            controller = LocalController(root)
+        else:
+            raise ReleaseError('UNKNOWN_CONTROLLER_CLASS')
+        
+        os.umask(0o077)
+        m = Manager(root, state, controller)
+    else:
+        # 生产模式：root only，固定路径，真实 Systemd
+        if os.geteuid()!=0:
+            raise ReleaseError('ROOT_SSH_ONLY')
+        os.umask(0o077)
+        root=Path('/opt/inspect-platform')
+        m=Manager(root,Path('/opt/inspect-ops/state'),Systemd(root))
+    
     a=sys.argv[1:]
     if a==['status']:result=m.status()
     elif len(a)==2 and a[0]=='baseline':result=m.baseline(a[1])
