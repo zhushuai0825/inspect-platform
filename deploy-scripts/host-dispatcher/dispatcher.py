@@ -39,30 +39,45 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    """加载配置（支持环境变量覆盖）"""
+    """
+    加载配置
+    
+    安全：
+    - 生产配置固定（repo_url, branch）不接受环境变量覆盖
+    - 测试模式必须显式设置 RELEASE_ROOT + RELEASE_STATE
+    - 测试模式下可覆盖其他路径配置
+    """
     config = DEFAULT_CONFIG.copy()
     
-    # 从配置文件加载
+    # 从配置文件加载（生产）
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
             file_config = json.load(f)
         config.update(file_config)
     
-    # 环境变量覆盖（用于测试）
-    if 'GITHUB_REPO' in os.environ:
-        config['repo_url'] = os.environ['GITHUB_REPO']
-    if 'GITHUB_BRANCH' in os.environ:
-        config['branch'] = os.environ['GITHUB_BRANCH']
-    if 'SPOOL_DIR' in os.environ:
-        config['spool_dir'] = os.environ['SPOOL_DIR']
-    if 'WORK_DIR' in os.environ:
-        config['work_dir'] = os.environ['WORK_DIR']
-    if 'RELEASE_CLI' in os.environ:
-        config['release_cli'] = os.environ['RELEASE_CLI']
-    if 'RELEASE_ROOT' in os.environ:
+    # 测试模式：必须同时设置 RELEASE_ROOT 和 RELEASE_STATE
+    # 这是唯一允许覆盖配置的方式
+    is_test_mode = ('RELEASE_ROOT' in os.environ and 
+                    'RELEASE_STATE' in os.environ)
+    
+    if is_test_mode:
+        # 测试模式：允许覆盖路径配置（但不覆盖 repo_url/branch）
+        if 'GITHUB_REPO' in os.environ:
+            config['test_repo_url'] = os.environ['GITHUB_REPO']
+            config['repo_url'] = os.environ['GITHUB_REPO']
+        if 'SPOOL_DIR' in os.environ:
+            config['spool_dir'] = os.environ['SPOOL_DIR']
+        if 'WORK_DIR' in os.environ:
+            config['work_dir'] = os.environ['WORK_DIR']
+        if 'RELEASE_CLI' in os.environ:
+            config['release_cli'] = os.environ['RELEASE_CLI']
+        
         config['release_root'] = os.environ['RELEASE_ROOT']
-    if 'RELEASE_STATE' in os.environ:
         config['release_state'] = os.environ['RELEASE_STATE']
+        config['is_test_mode'] = True
+    else:
+        # 生产模式：不接受任何环境变量覆盖
+        config['is_test_mode'] = False
     
     return config
 
@@ -379,7 +394,8 @@ def execute_deploy(artifact_path, commit):
             CONFIG['release_root'],
             CONFIG['release_state']
         )
-        cmd_env['RELEASE_TEST_SKIP_PREFLIGHT'] = '1'
+        # 不跳过 preflight：实际执行候选测试
+        # cmd_env['RELEASE_TEST_SKIP_PREFLIGHT'] = '1'  # 已移除
         cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
     
     # Prepare

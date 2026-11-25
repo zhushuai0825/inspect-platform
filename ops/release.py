@@ -226,10 +226,28 @@ def main():
         root = Path(parts[0])
         state = Path(parts[1])
         
-        # Guard：拒绝生产路径
+        # Guard：拒绝生产路径（包括 .., symlink）
         prod_paths = ['/opt/inspect-platform', '/opt/inspect-ops']
+        
+        # 解析路径以处理 .. 和符号链接
+        try:
+            root_resolved = root.resolve()
+            state_resolved = state.resolve()
+        except Exception:
+            # 如果解析失败（路径不存在等），使用原始路径
+            root_resolved = root.absolute()
+            state_resolved = state.absolute()
+        
+        # 检查解析后的路径
         for prod_path in prod_paths:
-            if str(root).startswith(prod_path) or str(state).startswith(prod_path):
+            prod_path_obj = Path(prod_path)
+            # 检查是否是生产路径或其子目录
+            if (str(root_resolved).startswith(str(prod_path)) or
+                str(state_resolved).startswith(str(prod_path)) or
+                root_resolved == prod_path_obj or
+                state_resolved == prod_path_obj or
+                prod_path_obj in root_resolved.parents or
+                prod_path_obj in state_resolved.parents):
                 raise ReleaseError('SANDBOX_PRODUCTION_PATH_REJECTED')
         
         # 控制器类（默认 LocalController）
