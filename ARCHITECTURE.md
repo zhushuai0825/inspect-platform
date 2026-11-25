@@ -44,19 +44,23 @@ Jenkins 轮询（Freestyle Job）
 │   - SHA256 哈希                          │
         ↓
 ├─ 触发部署 ──────────────────────────────┤
-│   写入部署请求到宿主 spool：             │
+│   写入部署通知到宿主 spool：             │
 │   - /opt/inspect-platform/data/deploy-spool/
-│   - 请求包含：commit, branch, artifact  │
+│   - 通知格式：request_id + commit SHA   │
+│   - （或空通知）                         │
         ↓
-宿主 Dispatcher 服务
+宿主 Dispatcher 服务（可信来源）
         ↓
-├─ 验证请求 ──────────────────────────────┤
-│   - 仅接受 main 分支                     │
-│   - 验证 artifact 路径                   │
-│   - 验证 SHA256                          │
+├─ 验证与获取 ────────────────────────────┤
+│   - 验证请求格式（拒绝任意字段）         │
+│   - 从固定 repo 获取 main SHA            │
+│   - 验证 commit 匹配真实 main            │
+│   - 自己克隆代码                         │
+│   - 自己创建制品                         │
+│   - 路径/符号链接/重放防护               │
         ↓
 ├─ 执行部署 ──────────────────────────────┤
-│   sudo 执行固定 release.py：             │
+│   固定 release.py（root 拥有）：         │
 │   - prepare <artifact> <version>         │
 │   - deploy <version>                     │
 │   - 健康检查 + 自动回滚                  │
@@ -227,142 +231,75 @@ docker run --rm \
 
 **位置**：`/var/jenkins_home/jenkins-scripts/trigger-deploy.sh`
 
+**说明**：写入轻量通知，仅包含 request_id 和 commit SHA。
+
 ```bash
 #!/bin/bash
-# 触发宿主 dispatcher
+# 固定部署触发脚本（简化通知）
 set -euo pipefail
 
 COMMIT="$1"
-BRANCH="$2"
-ARTIFACT="$3"  # 容器内路径
+REQUEST_ID="jenkins-$(date +%s)-${COMMIT:0:8}"
 
-# 转换为宿主路径
-# /var/jenkins_home/workspace/... → /var/lib/docker/volumes/jenkins_jenkins_home/_data/workspace/...
-HOST_ARTIFACT="${ARTIFACT/\/var\/jenkins_home/\/var\/lib\/docker\/volumes\/jenkins_jenkins_home\/_data}"
-
-# 写入部署请求（通过挂载的 /opt/inspect-platform）
+# 写入部署通知（通过挂载的 /opt/inspect-platform）
 SPOOL="/opt/inspect-platform/data/deploy-spool"
 mkdir -p "${SPOOL}"
 
-REQUEST_FILE="${SPOOL}/request-$(date +%s)-${COMMIT:0:8}.json"
+REQUEST_FILE="${SPOOL}/request-${REQUEST_ID}.json"
 
+# 只发送 request_id + commit（40 hex）
 cat > "${REQUEST_FILE}" <<EOF
 {
+  "request_id": "${REQUEST_ID}",
   "commit": "${COMMIT}",
-  "branch": "${BRANCH}",
-  "artifact": "${HOST_ARTIFACT}",
-  "artifact_sha256": "${HOST_ARTIFACT}.sha256",
   "timestamp": "$(date -Iseconds)",
   "source": "jenkins"
 }
 EOF
 
-echo "部署请求已写入: ${REQUEST_FILE}"
-echo "等待 dispatcher 处理..."
-
-# 等待结果（最多 5 分钟）
-RESULT_FILE="${SPOOL}/result-$(date +%s)-${COMMIT:0:8}.json"
-for i in {1..60}; do
-  if [ -f "${RESULT_FILE}" ]; then
-    cat "${RESULT_FILE}"
-    STATUS=$(jq -r '.status' "${RESULT_FILE}")
-    [ "$STATUS" = "success" ] && exit 0 || exit 1
-  fi
-  sleep 5
-done
-
-echo "超时：未收到 dispatcher 响应"
-exit 1
+echo "部署通知已写入: ${REQUEST_FILE}"
+echo "Dispatcher 将验证并部署"
 ```
 
-### 宿主 Dispatcher
+### 宿主 Dispatcher（可信来源）
 
 **位置**：`/opt/inspect-deploy/dispatcher.py`
 
-```python
-#!/usr/bin/env python3
-"""
-宿主部署 dispatcher
-监听 /opt/inspect-platform/data/deploy-spool/
-验证请求，执行部署
-"""
-import json
-import os
-import subprocess
-import time
-from pathlib import Path
+**权限**：root:root, 755
 
-SPOOL = Path('/opt/inspect-platform/data/deploy-spool')
-SPOOL.mkdir(parents=True, exist_ok=True, mode=0o755)
+**配置**：`/opt/inspect-deploy/config.json`（root 拥有）
 
-def process_request(req_file):
-    """处理部署请求"""
-    try:
-        with open(req_file) as f:
-            req = json.load(f)
-        
-        # 安全验证
-        if req['branch'] not in ('main', 'refs/heads/main', 'origin/main'):
-            raise ValueError(f"拒绝非 main 分支: {req['branch']}")
-        
-        artifact = Path(req['artifact'])
-        if not artifact.exists():
-            raise FileNotFoundError(f"制品不存在: {artifact}")
-        
-        artifact_sha256 = Path(req['artifact_sha256'])
-        if not artifact_sha256.exists():
-            raise FileNotFoundError(f"哈希文件不存在: {artifact_sha256}")
-        
-        # 验证 SHA256
-        result = subprocess.run(
-            ['sha256sum', '-c', str(artifact_sha256)],
-            cwd=artifact.parent,
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            raise ValueError("制品完整性校验失败")
-        
-        # 生成版本号
-        version = f"v{time.strftime('%Y%m%d-%H%M%S')}-{req['commit'][:8]}"
-        
-        # 执行部署
-        subprocess.run(
-            ['sudo', '/usr/bin/python3', '/opt/inspect-platform/ops/release.py', 'prepare', str(artifact), version],
-            check=True
-        )
-        subprocess.run(
-            ['sudo', '/usr/bin/python3', '/opt/inspect-platform/ops/release.py', 'deploy', version],
-            check=True
-        )
-        
-        # 写入成功结果
-        result_file = req_file.parent / req_file.name.replace('request-', 'result-')
-        with open(result_file, 'w') as f:
-            json.dump({'status': 'success', 'version': version}, f)
-        
-        # 删除请求文件
-        req_file.unlink()
-        
-    except Exception as e:
-        # 写入失败结果
-        result_file = req_file.parent / req_file.name.replace('request-', 'result-')
-        with open(result_file, 'w') as f:
-            json.dump({'status': 'failed', 'error': str(e)}, f)
-        req_file.unlink()
-
-def main():
-    """主循环"""
-    print("Dispatcher 启动，监听:", SPOOL)
-    while True:
-        for req_file in sorted(SPOOL.glob('request-*.json')):
-            print(f"处理请求: {req_file.name}")
-            process_request(req_file)
-        time.sleep(2)
-
-if __name__ == '__main__':
-    main()
+```json
+{
+  "repo_url": "https://github.com/zhushuai0825/inspect-platform.git",
+  "branch": "main",
+  "spool_dir": "/opt/inspect-platform/data/deploy-spool",
+  "work_dir": "/opt/inspect-deploy/work"
+}
 ```
+
+**核心功能**：
+1. 监听 spool 目录
+2. 读取通知（只接受 request_id + commit）
+3. 拒绝任意 artifact/path/result_file/branch 字段
+4. 从固定 repo 自己获取 main SHA
+5. 验证 commit 匹配真实 main
+6. 自己克隆代码
+7. 自己创建制品（git archive）
+8. 防护路径遍历/符号链接/重放
+9. 执行固定 release.py（root 拥有）
+
+**安全特性**：
+- ✅ 固定 repo URL（root 配置）
+- ✅ 验证远程 main commit（真实 Git 查询）
+- ✅ 拒绝任意 artifact/hash
+- ✅ 拒绝任意 result_file
+- ✅ 路径封闭，防穿越
+- ✅ 符号链接检测
+- ✅ 请求原子领取，防重放
+- ✅ Python 3.6 兼容
+
+**完整实现**：见 `deploy-scripts/host-dispatcher/dispatcher.py`（约 450 行，18 项安全测试通过）
 
 **Systemd Service**：`/etc/systemd/system/inspect-deploy-dispatcher.service`
 

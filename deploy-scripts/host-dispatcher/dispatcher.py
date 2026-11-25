@@ -1,153 +1,552 @@
 #!/usr/bin/env python3
 """
-宿主部署 Dispatcher
+安全的部署 Dispatcher - Main-only 可信来源
 部署位置：/opt/inspect-deploy/dispatcher.py
 权限：root:root, 755
 运行：systemd service
 
-功能：
-- 监听 /opt/inspect-platform/data/deploy-spool/
-- 验证部署请求（仅 main 分支）
-- 验证制品完整性
-- 执行部署（调用固定 release.py）
-- 写入结果
+安全设计：
+- 固定 repo URL（配置文件）
+- 自己从受信 repo 获取代码
+- 验证远程 main commit
+- 自己创建制品
+- 路径严格封闭
+- 防重放/路径遍历/符号链接
+- Python 3.6 兼容
 """
+import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-SPOOL = Path('/opt/inspect-platform/data/deploy-spool')
-LOG_FILE = Path('/opt/inspect-deploy/dispatcher.log')
+# Python 3.6 兼容：不使用 capture_output
+PYTHON36_COMPAT = sys.version_info < (3, 7)
+
+# 配置（由 root 拥有的配置文件加载）
+CONFIG_FILE = Path('/opt/inspect-deploy/config.json')
+DEFAULT_CONFIG = {
+    'repo_url': 'https://github.com/zhushuai0825/inspect-platform.git',
+    'branch': 'main',
+    'spool_dir': '/opt/inspect-platform/data/deploy-spool',
+    'work_dir': '/opt/inspect-deploy/work',
+    'log_file': '/opt/inspect-deploy/dispatcher.log'
+}
+
+def load_config():
+    """加载配置"""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            config = json.load(f)
+        # 合并默认配置
+        return {**DEFAULT_CONFIG, **config}
+    return DEFAULT_CONFIG
+
+CONFIG = load_config()
+SPOOL = Path(CONFIG['spool_dir'])
+WORK_DIR = Path(CONFIG['work_dir'])
+LOG_FILE = Path(CONFIG['log_file'])
 
 def log(msg):
-    """写日志"""
+    """写日志（Python 3.6 兼容）"""
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    line = f"[{timestamp}] {msg}\n"
+    line = '[{}] {}\n'.format(timestamp, msg)
     print(line, end='')
     sys.stdout.flush()
     
     if LOG_FILE.parent.exists():
-        with open(LOG_FILE, 'a') as f:
+        with open(str(LOG_FILE), 'a') as f:
             f.write(line)
 
-def validate_request(req):
-    """验证请求"""
-    # 分支验证
-    allowed_branches = ('main', 'refs/heads/main', 'origin/main')
-    if req.get('branch') not in allowed_branches:
-        raise ValueError(f"拒绝非 main 分支: {req.get('branch')}")
-    
-    # 制品存在性
-    artifact = Path(req.get('artifact', ''))
-    if not artifact.exists():
-        raise FileNotFoundError(f"制品不存在: {artifact}")
-    
-    artifact_sha256 = Path(req.get('artifact_sha256', ''))
-    if not artifact_sha256.exists():
-        raise FileNotFoundError(f"哈希文件不存在: {artifact_sha256}")
-    
-    # 验证 SHA256
-    log(f"验证制品完整性: {artifact.name}")
-    result = subprocess.run(
-        ['sha256sum', '-c', artifact_sha256.name],
-        cwd=artifact.parent,
-        capture_output=True,
-        text=True
+def run_command(cmd, cwd=None, timeout=300):
+    """运行命令（Python 3.6 兼容）"""
+    # Python 3.6: 使用 universal_newlines 和 PIPE
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
     )
-    if result.returncode != 0:
-        raise ValueError(f"制品完整性校验失败: {result.stderr}")
-    
-    log("✓ 请求验证通过")
-    return artifact
-
-def execute_deploy(artifact, commit):
-    """执行部署"""
-    version = f"v{time.strftime('%Y%m%d-%H%M%S')}-{commit[:8]}"
-    log(f"部署版本: {version}")
-    
-    # Prepare
-    log("执行: prepare")
-    subprocess.run(
-        ['sudo', '/usr/bin/python3', '/opt/inspect-platform/ops/release.py', 
-         'prepare', str(artifact), version],
-        check=True,
-        capture_output=True
-    )
-    
-    # Deploy
-    log("执行: deploy")
-    subprocess.run(
-        ['sudo', '/usr/bin/python3', '/opt/inspect-platform/ops/release.py', 
-         'deploy', version],
-        check=True,
-        capture_output=True
-    )
-    
-    log(f"✓ 部署成功: {version}")
-    return version
-
-def process_request(req_file):
-    """处理一个部署请求"""
-    log(f"处理请求: {req_file.name}")
     
     try:
-        with open(req_file) as f:
-            req = json.load(f)
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise Exception('命令超时: {}'.format(' '.join(cmd)))
+
+def validate_commit_sha(commit):
+    """验证 commit SHA 格式（40 hex）"""
+    if not isinstance(commit, str):
+        return False
+    if len(commit) != 40:
+        return False
+    if not re.match(r'^[0-9a-f]{40}$', commit):
+        return False
+    return True
+
+def validate_request(req):
+    """
+    验证请求
+    
+    安全要求：
+    - 只接受 request_id 和 commit（可选）
+    - 拒绝任意 artifact/path/result_file 等字段
+    - commit 必须是 40 hex（如提供）
+    """
+    if not isinstance(req, dict):
+        raise ValueError('请求必须是 JSON 对象')
+    
+    # 只允许这些字段
+    allowed_fields = {'request_id', 'commit', 'timestamp', 'source'}
+    unknown_fields = set(req.keys()) - allowed_fields
+    if unknown_fields:
+        raise ValueError('拒绝未知字段: {}'.format(', '.join(unknown_fields)))
+    
+    # request_id 必需
+    if 'request_id' not in req:
+        raise ValueError('缺少 request_id')
+    
+    # 验证 commit 格式（如提供）
+    if 'commit' in req:
+        if not validate_commit_sha(req['commit']):
+            raise ValueError('commit 必须是 40 位十六进制')
+    
+    log('✓ 请求格式验证通过')
+    return True
+
+def get_remote_main_sha(repo_url, branch='main'):
+    """
+    获取远程 main 分支的 commit SHA
+    
+    安全：从受信 repo 获取，不信任请求
+    """
+    log('获取远程 {} 分支 SHA: {}'.format(branch, repo_url))
+    
+    # 使用 git ls-remote 获取远程分支 SHA
+    cmd = ['git', 'ls-remote', repo_url, 'refs/heads/{}'.format(branch)]
+    returncode, stdout, stderr = run_command(cmd, timeout=30)
+    
+    if returncode != 0:
+        raise Exception('git ls-remote 失败: {}'.format(stderr))
+    
+    # 解析输出：<SHA>\trefs/heads/main
+    lines = stdout.strip().split('\n')
+    if not lines or not lines[0]:
+        raise Exception('未找到分支: {}'.format(branch))
+    
+    parts = lines[0].split('\t')
+    if len(parts) < 1:
+        raise Exception('无法解析 git ls-remote 输出')
+    
+    sha = parts[0].strip()
+    
+    if not validate_commit_sha(sha):
+        raise Exception('远程返回的 SHA 格式无效: {}'.format(sha))
+    
+    log('远程 {} SHA: {}'.format(branch, sha))
+    return sha
+
+def verify_commit_match(req, remote_sha):
+    """
+    验证请求的 commit（如提供）与远程 main 一致
+    
+    安全：防止假 commit
+    """
+    if 'commit' not in req:
+        # 空通知，不验证 commit
+        log('空通知（无 commit）')
+        return remote_sha
+    
+    req_commit = req['commit']
+    
+    if req_commit != remote_sha:
+        raise ValueError(
+            '请求 commit ({}) 与远程 main ({}) 不匹配'.format(
+                req_commit[:8], remote_sha[:8]
+            )
+        )
+    
+    log('✓ Commit 验证通过: {}'.format(req_commit[:8]))
+    return req_commit
+
+def safe_path_join(base, *parts):
+    """
+    安全路径拼接
+    
+    安全：防止路径遍历
+    """
+    base = Path(base).resolve()
+    result = base.joinpath(*parts).resolve()
+    
+    # 确保结果在 base 下
+    try:
+        result.relative_to(base)
+    except ValueError:
+        raise ValueError('路径穿越尝试: {}'.format(result))
+    
+    return result
+
+def check_no_symlinks(path):
+    """
+    检查路径及其父目录中无符号链接
+    
+    安全：防止符号链接攻击
+    """
+    # 不能先 resolve()，会丢失符号链接信息
+    path = Path(path)
+    
+    # 检查路径本身
+    if path.is_symlink():
+        raise ValueError('拒绝符号链接: {}'.format(path))
+    
+    # 检查每个父目录
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise ValueError('拒绝符号链接: {}'.format(parent))
+        # 到根目录停止
+        if parent == parent.parent:
+            break
+
+def fetch_source(repo_url, commit, work_dir):
+    """
+    从受信 repo 获取指定 commit 的源代码
+    
+    安全：
+    - 使用临时目录
+    - 浅克隆
+    - 验证 commit 存在
+    """
+    log('获取源代码: {} @ {}'.format(repo_url, commit[:8]))
+    
+    # 创建临时 clone 目录
+    clone_dir = safe_path_join(work_dir, 'clone-{}'.format(commit[:8]))
+    
+    if clone_dir.exists():
+        shutil.rmtree(str(clone_dir))
+    
+    clone_dir.mkdir(parents=True, mode=0o700)
+    
+    try:
+        # 浅克隆（节省空间和时间）
+        log('克隆仓库...')
+        cmd = ['git', 'clone', '--depth', '50', repo_url, str(clone_dir)]
+        returncode, stdout, stderr = run_command(cmd, timeout=120)
         
-        # 验证
-        artifact = validate_request(req)
+        if returncode != 0:
+            raise Exception('git clone 失败: {}'.format(stderr))
         
-        # 执行部署
-        version = execute_deploy(artifact, req['commit'])
+        # 切换到指定 commit
+        log('切换到 commit {}...'.format(commit[:8]))
+        cmd = ['git', 'checkout', commit]
+        returncode, stdout, stderr = run_command(cmd, cwd=str(clone_dir), timeout=30)
         
-        # 写入成功结果
-        result_file = Path(req.get('result_file', 
-                                   str(req_file).replace('request-', 'result-')))
-        with open(result_file, 'w') as f:
-            json.dump({
-                'status': 'success',
-                'version': version,
-                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')
-            }, f, indent=2)
+        if returncode != 0:
+            raise Exception('git checkout 失败: {}'.format(stderr))
         
-        # 删除请求文件
-        req_file.unlink()
-        log(f"✓ 请求处理完成")
+        # 验证当前 HEAD
+        cmd = ['git', 'rev-parse', 'HEAD']
+        returncode, stdout, stderr = run_command(cmd, cwd=str(clone_dir), timeout=10)
+        
+        if returncode != 0:
+            raise Exception('git rev-parse 失败: {}'.format(stderr))
+        
+        actual_commit = stdout.strip()
+        
+        if actual_commit != commit:
+            raise Exception(
+                'Commit 不匹配: 预期 {}, 实际 {}'.format(commit[:8], actual_commit[:8])
+            )
+        
+        log('✓ 源代码获取成功')
+        return clone_dir
         
     except Exception as e:
-        log(f"✗ 请求处理失败: {e}")
+        # 清理失败的克隆
+        if clone_dir.exists():
+            shutil.rmtree(str(clone_dir))
+        raise
+
+def create_artifact(source_dir, commit):
+    """
+    创建部署制品
+    
+    安全：
+    - 使用 git archive（不包含 .git）
+    - 计算 SHA256
+    - 保存在封闭目录
+    """
+    log('创建制品: {}'.format(commit[:8]))
+    
+    # 制品目录
+    artifacts_dir = safe_path_join(WORK_DIR, 'artifacts')
+    artifacts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    
+    artifact_name = 'inspect-platform-{}.zip'.format(commit[:8])
+    artifact_path = safe_path_join(artifacts_dir, artifact_name)
+    
+    # 使用 git archive
+    cmd = [
+        'git', 'archive',
+        '--format=zip',
+        '--prefix=inspect-platform/',
+        'HEAD',
+        '--output', str(artifact_path)
+    ]
+    
+    returncode, stdout, stderr = run_command(cmd, cwd=str(source_dir), timeout=60)
+    
+    if returncode != 0:
+        raise Exception('git archive 失败: {}'.format(stderr))
+    
+    if not artifact_path.exists():
+        raise Exception('制品未创建')
+    
+    # 计算 SHA256
+    log('计算 SHA256...')
+    sha256 = hashlib.sha256()
+    with open(str(artifact_path), 'rb') as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            sha256.update(chunk)
+    
+    hash_value = sha256.hexdigest()
+    hash_file = safe_path_join(artifacts_dir, artifact_name + '.sha256')
+    
+    with open(str(hash_file), 'w') as f:
+        f.write('{}  {}\n'.format(hash_value, artifact_name))
+    
+    log('✓ 制品已创建: {} ({} bytes)'.format(
+        artifact_name, artifact_path.stat().st_size
+    ))
+    
+    return artifact_path, hash_file
+
+def execute_deploy(artifact_path, commit):
+    """
+    执行部署
+    
+    安全：
+    - 调用固定的 release.py（root 拥有）
+    - 不执行 repo 中的代码
+    """
+    version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
+    log('部署版本: {}'.format(version))
+    
+    # 固定的 release.py 路径
+    release_py = '/opt/inspect-platform/ops/release.py'
+    
+    if not Path(release_py).exists():
+        raise Exception('release.py 不存在: {}'.format(release_py))
+    
+    # Prepare
+    log('执行: prepare')
+    cmd = ['sudo', '/usr/bin/python3', release_py, 'prepare', str(artifact_path), version]
+    
+    # Python 3.6 兼容
+    if PYTHON36_COMPAT:
+        returncode, stdout, stderr = run_command(cmd, timeout=300)
+    else:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    
+    if returncode != 0:
+        raise Exception('prepare 失败: {}'.format(stderr))
+    
+    # Deploy
+    log('执行: deploy')
+    cmd = ['sudo', '/usr/bin/python3', release_py, 'deploy', version]
+    
+    if PYTHON36_COMPAT:
+        returncode, stdout, stderr = run_command(cmd, timeout=600)
+    else:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    
+    if returncode != 0:
+        raise Exception('deploy 失败: {}'.format(stderr))
+    
+    log('✓ 部署成功: {}'.format(version))
+    return version
+
+def generate_result_path(request_id):
+    """
+    生成安全的结果文件路径
+    
+    安全：
+    - 由服务生成，不接受请求控制
+    - 封闭在 spool 目录
+    - 防止路径遍历
+    """
+    # 只允许字母数字和连字符
+    safe_id = re.sub(r'[^a-zA-Z0-9-]', '', request_id)[:64]
+    if not safe_id:
+        safe_id = str(int(time.time()))
+    
+    result_name = 'result-{}.json'.format(safe_id)
+    result_path = safe_path_join(SPOOL, result_name)
+    
+    # 再次验证
+    check_no_symlinks(result_path.parent)
+    
+    return result_path
+
+def atomic_write_result(result_path, data):
+    """
+    原子写入结果
+    
+    安全：
+    - 使用临时文件 + rename
+    - 避免部分写入
+    """
+    # 写入临时文件
+    temp_fd, temp_path = tempfile.mkstemp(
+        prefix='.result-',
+        dir=str(result_path.parent),
+        text=True
+    )
+    
+    try:
+        with os.fdopen(temp_fd, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
         
-        # 写入失败结果
+        # 原子 rename
+        os.chmod(temp_path, 0o644)
+        os.replace(temp_path, str(result_path))
+        
+    finally:
+        # 清理临时文件（如果失败）
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+def claim_request(req_file):
+    """
+    原子领取请求
+    
+    安全：
+    - 防止重复处理
+    - 使用 rename
+    """
+    claimed_name = req_file.name.replace('request-', 'claimed-')
+    claimed_path = req_file.parent / claimed_name
+    
+    try:
+        # 原子 rename（防止并发）
+        req_file.rename(claimed_path)
+        return claimed_path
+    except (OSError, FileNotFoundError):
+        # 文件已被其他进程领取
+        return None
+
+def process_request(req_file):
+    """
+    处理一个部署请求
+    
+    安全：
+    - 原子领取
+    - 严格验证
+    - 自己获取代码
+    - 封闭路径
+    """
+    log('=' * 60)
+    log('处理请求: {}'.format(req_file.name))
+    
+    # 原子领取
+    claimed_file = claim_request(req_file)
+    if claimed_file is None:
+        log('请求已被其他进程领取')
+        return
+    
+    result_data = {
+        'status': 'failed',
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')
+    }
+    result_path = None
+    
+    try:
+        # 读取请求
+        with open(str(claimed_file)) as f:
+            req = json.load(f)
+        
+        # 生成结果路径（由服务控制）
+        result_path = generate_result_path(req.get('request_id', 'unknown'))
+        
+        # 验证请求格式
+        validate_request(req)
+        
+        # 获取远程 main SHA
+        remote_sha = get_remote_main_sha(CONFIG['repo_url'], CONFIG['branch'])
+        
+        # 验证 commit（如提供）
+        commit = verify_commit_match(req, remote_sha)
+        
+        # 获取源代码
+        source_dir = fetch_source(CONFIG['repo_url'], commit, WORK_DIR)
+        
         try:
-            with open(req_file) as f:
-                req = json.load(f)
+            # 创建制品
+            artifact_path, hash_file = create_artifact(source_dir, commit)
             
-            result_file = Path(req.get('result_file', 
-                                       str(req_file).replace('request-', 'result-')))
-            with open(result_file, 'w') as f:
-                json.dump({
-                    'status': 'failed',
-                    'error': str(e),
-                    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')
-                }, f, indent=2)
-        except Exception:
-            pass
+            # 执行部署
+            version = execute_deploy(artifact_path, commit)
+            
+            # 成功
+            result_data = {
+                'status': 'success',
+                'version': version,
+                'commit': commit,
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')
+            }
+            
+            log('✓ 请求处理成功')
+            
+        finally:
+            # 清理源代码
+            if source_dir.exists():
+                shutil.rmtree(str(source_dir))
         
-        # 删除请求文件
-        req_file.unlink()
+    except Exception as e:
+        log('✗ 请求处理失败: {}'.format(e))
+        result_data['error'] = str(e)
+    
+    finally:
+        # 写入结果
+        if result_path:
+            try:
+                atomic_write_result(result_path, result_data)
+            except Exception as e:
+                log('写入结果失败: {}'.format(e))
+        
+        # 删除已处理的请求
+        if claimed_file and claimed_file.exists():
+            claimed_file.unlink()
 
 def main():
     """主循环"""
-    log("=" * 60)
-    log("Inspect Deploy Dispatcher 启动")
-    log(f"监听目录: {SPOOL}")
-    log("=" * 60)
+    log('=' * 60)
+    log('Inspect Deploy Dispatcher 启动')
+    log('配置:')
+    log('  Repo: {}'.format(CONFIG['repo_url']))
+    log('  Branch: {}'.format(CONFIG['branch']))
+    log('  Spool: {}'.format(SPOOL))
+    log('  Work: {}'.format(WORK_DIR))
+    log('=' * 60)
     
-    # 确保 spool 目录存在
+    # 确保目录存在
     SPOOL.mkdir(parents=True, exist_ok=True, mode=0o755)
+    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     
     while True:
         try:
@@ -155,16 +554,29 @@ def main():
             requests = sorted(SPOOL.glob('request-*.json'))
             
             for req_file in requests:
-                process_request(req_file)
+                try:
+                    process_request(req_file)
+                except Exception as e:
+                    log('处理请求异常: {}'.format(e))
             
-            # 清理旧结果文件（超过 1 小时）
+            # 清理旧文件（超过 1 小时）
             cutoff = time.time() - 3600
-            for result_file in SPOOL.glob('result-*.json'):
-                if result_file.stat().st_mtime < cutoff:
-                    result_file.unlink()
+            for old_file in SPOOL.glob('result-*.json'):
+                try:
+                    if old_file.stat().st_mtime < cutoff:
+                        old_file.unlink()
+                except Exception:
+                    pass
+            
+            for old_file in SPOOL.glob('claimed-*.json'):
+                try:
+                    if old_file.stat().st_mtime < cutoff:
+                        old_file.unlink()
+                except Exception:
+                    pass
             
         except Exception as e:
-            log(f"主循环错误: {e}")
+            log('主循环错误: {}'.format(e))
         
         time.sleep(2)
 
