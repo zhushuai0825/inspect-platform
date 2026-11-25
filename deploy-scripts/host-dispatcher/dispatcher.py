@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 # Python 3.6 兼容：不使用 capture_output
@@ -311,14 +312,20 @@ def fetch_source(repo_url, commit, work_dir):
 
 def create_artifact(source_dir, commit):
     """
-    创建部署制品
+    创建部署制品（白名单过滤）
     
     安全：
-    - 使用 git archive（不包含 .git）
+    - 只打包白名单文件（与ops/release.py一致）
+    - 排除控制面（deploy-scripts/, control-plane/）
+    - 排除secrets, .git
     - 计算 SHA256
-    - 保存在封闭目录
     """
     log('创建制品: {}'.format(commit[:8]))
+    
+    # 白名单（与 ops/release.py RUNTIME|OPS 完全一致）
+    RUNTIME = set(""".gitignore DEPLOYMENT.md MAIL-ACTIVATION.md MAIL-SETUP.md README.md admin-static/admin.css admin-static/app.js admin-static/index.html admin.py app.py core.py deploy/inspect-admin.service deploy/inspect-mail.service deploy/inspect-platform.service deploy/inspect-worker.service deploy/update_job.py inspect_run.sh jenkins/Jenkinsfile notifications.py static/app.js static/index.html static/styles.css tests/test_notifications.py tests/test_platform.py worker.py""".split())
+    OPS = {'ops/release.py', 'ops/test_release.py', 'ops/RELEASE.md'}
+    WHITELIST = RUNTIME | OPS
     
     # 制品目录
     artifacts_dir = safe_path_join(WORK_DIR, 'artifacts')
@@ -327,25 +334,27 @@ def create_artifact(source_dir, commit):
     artifact_name = 'inspect-platform-{}.zip'.format(commit[:8])
     artifact_path = safe_path_join(artifacts_dir, artifact_name)
     
-    # 使用 git archive
-    cmd = [
-        'git', 'archive',
-        '--format=zip',
-        '--prefix=inspect-platform/',
-        'HEAD',
-        '--output', str(artifact_path)
-    ]
+    # 创建zip（只包含白名单文件）
+    log('打包白名单: {} 个文件'.format(len(WHITELIST)))
+    packed_count = 0
+    missing_count = 0
     
-    returncode, stdout, stderr = run_command(cmd, cwd=str(source_dir), timeout=60)
-    
-    if returncode != 0:
-        raise Exception('git archive 失败: {}'.format(stderr))
+    with zipfile.ZipFile(str(artifact_path), 'w', zipfile.ZIP_DEFLATED) as z:
+        for file_path in sorted(WHITELIST):
+            src_file = source_dir / file_path
+            if src_file.exists() and src_file.is_file():
+                z.write(str(src_file), 'inspect-platform/' + file_path)
+                packed_count += 1
+            else:
+                missing_count += 1
+                log('警告: 白名单文件缺失: {}'.format(file_path))
     
     if not artifact_path.exists():
         raise Exception('制品未创建')
     
+    log('✓ 已打包: {} 个文件 ({} 个缺失)'.format(packed_count, missing_count))
+    
     # 计算 SHA256
-    log('计算 SHA256...')
     sha256 = hashlib.sha256()
     with open(str(artifact_path), 'rb') as f:
         while True:
@@ -360,9 +369,7 @@ def create_artifact(source_dir, commit):
     with open(str(hash_file), 'w') as f:
         f.write('{}  {}\n'.format(hash_value, artifact_name))
     
-    log('✓ 制品已创建: {} ({} bytes)'.format(
-        artifact_name, artifact_path.stat().st_size
-    ))
+    log('✓ 制品: {} ({} bytes)'.format(artifact_name, artifact_path.stat().st_size))
     
     return artifact_path, hash_file
 

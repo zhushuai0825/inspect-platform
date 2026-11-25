@@ -1,28 +1,57 @@
 [Unit]
-Description=Inspect Platform Deploy Dispatcher (Trusted Source)
-After=network.target docker.service
+Description=Inspect Deploy Dispatcher
+Documentation=https://github.com/zhushuai0825/inspect-platform
+After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-ExecStart=/usr/bin/python3 /opt/inspect-deploy/dispatcher.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
+User=inspect-dispatcher
+Group=inspect-dispatcher
+WorkingDirectory=/var/lib/inspect-deploy
+
+# 控制面（只读）
+# /opt/inspect-deploy: 可信控制面脚本（release.py, dispatcher.py, runner）
+ReadOnlyPaths=/opt/inspect-deploy
+
+# 应用访问（读写）
+# /opt/inspect-platform: 应用根目录（非source子目录）
+# /opt/inspect-platform/data/deploy-spool: dispatcher读写部署请求
+# /opt/inspect-platform/state: release写入版本状态
+# /var/lib/inspect-deploy: dispatcher工作目录
+ProtectSystem=strict
+ReadWritePaths=/opt/inspect-platform
+ReadWritePaths=/var/lib/inspect-deploy
+
+# 临时目录（Git clone等）
+PrivateTmp=yes
 
 # 安全加固
-PrivateTmp=yes
 NoNewPrivileges=yes
-ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/inspect-deploy /opt/inspect-platform/data/deploy-spool /opt/inspect-ops
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# 资源限制
-MemoryLimit=512M
-CPUQuota=50%
-TasksMax=50
+# 能力限制
+# dispatcher需要调用sudo执行release.py
+# 通过 /etc/sudoers.d/inspect-deploy 配置sudo权限
+CapabilityBoundingSet=
+
+# 环境
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+
+# 启动命令
+ExecStart=/usr/bin/python3 /opt/inspect-deploy/bin/dispatcher.py
+
+# 重启策略
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target

@@ -111,41 +111,66 @@ class Manager:
         if not runner_path.exists():
             raise ReleaseError('PREFLIGHT_RUNNER_MISSING')
         
-        # 验证runner安全性：文件及父目录
-        # 生产（root）：owner必须是root（uid=0）
-        # 测试（非root）：owner检查放宽（允许当前用户）
-        # mode始终不可组写(020)或他人写(002)
+        # 验证runner安全性：文件及完整祖先链
+        # Root模式：owner=root，检查到根
+        # 非root测试：跳过owner检查，检查到受保护锚点
+        # 所有模式：拒绝符号链接，拒绝组写/他人写
         try:
+            runner_path_resolved = runner_path.resolve()
+            is_root_mode = os.geteuid() == 0
+            
             # 检查文件不是符号链接
             if runner_path.is_symlink():
                 raise ReleaseError('PREFLIGHT_RUNNER_IS_SYMLINK')
             
+            # 检查路径规范化
+            if str(runner_path_resolved) != str(runner_path.absolute()):
+                raise ReleaseError('PREFLIGHT_RUNNER_PATH_TRAVERSAL')
+            
+            # 验证文件本身
             stat_info = runner_path.stat()
             
-            # Owner检查
-            if os.geteuid() == 0:
-                # Root生产模式：runner必须root-owned
-                if stat_info.st_uid != 0:
-                    raise ReleaseError('PREFLIGHT_RUNNER_NOT_ROOT_OWNED')
-            else:
-                # 非root测试模式：runner可以是当前用户owned
-                # （实际生产由root生产模式保证）
-                pass
+            if is_root_mode and stat_info.st_uid != 0:
+                raise ReleaseError('PREFLIGHT_RUNNER_NOT_ROOT_OWNED')
             
-            # Mode检查（生产和测试都要求）
-            if stat_info.st_mode & 0o022:  # 检查组写(020)或他人写(002)
+            if stat_info.st_mode & 0o022:
                 raise ReleaseError('PREFLIGHT_RUNNER_WORLD_WRITABLE')
             
-            # 检查父目录
-            parent = runner_path.parent
-            parent_stat = parent.stat()
+            # 验证完整祖先链
+            current = runner_path.parent
+            ancestors_checked = 0
             
-            if os.geteuid() == 0:
-                if parent_stat.st_uid != 0:
-                    raise ReleaseError('PREFLIGHT_RUNNER_PARENT_NOT_ROOT_OWNED')
+            # 受保护锚点（非root测试）
+            protected_anchors = []
+            if not is_root_mode:
+                runner_str = str(runner_path)
+                if runner_str.startswith('/tmp/'):
+                    parts = runner_str.split('/')
+                    if len(parts) >= 3:
+                        protected_anchors.append(Path('/' + parts[1] + '/' + parts[2]))
             
-            if parent_stat.st_mode & 0o022:
-                raise ReleaseError('PREFLIGHT_RUNNER_PARENT_WORLD_WRITABLE')
+            while current != current.parent:
+                ancestors_checked += 1
+                if ancestors_checked > 100:
+                    raise ReleaseError('PREFLIGHT_RUNNER_ANCESTOR_TOO_DEEP')
+                
+                # 受保护锚点：停止检查
+                if current in protected_anchors:
+                    break
+                
+                # 检查祖先不是符号链接
+                if current.is_symlink():
+                    raise ReleaseError('PREFLIGHT_RUNNER_ANCESTOR_SYMLINK')
+                
+                ancestor_stat = current.stat()
+                
+                if is_root_mode and ancestor_stat.st_uid != 0:
+                    raise ReleaseError('PREFLIGHT_RUNNER_ANCESTOR_NOT_ROOT_OWNED')
+                
+                if ancestor_stat.st_mode & 0o022:
+                    raise ReleaseError('PREFLIGHT_RUNNER_ANCESTOR_WRITABLE')
+                
+                current = current.parent
                 
         except OSError as e:
             raise ReleaseError('PREFLIGHT_RUNNER_STAT_FAILED')
