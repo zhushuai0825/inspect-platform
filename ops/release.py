@@ -212,6 +212,12 @@ class Manager:
                         seen.add(name);total+=item.file_size
                         if len(seen)>64 or total>4194304 or item.file_size>1048576:raise ReleaseError('ARCHIVE_LIMIT')
                         target=src/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(z.read(item))
+                # 设置候选源码权限为Docker runner可读（755/644）
+                # Root umask 077产生700/600，需要显式放宽供nobody读取
+                for root_path,dirs,files in os.walk(str(src)):
+                    for d in dirs:os.chmod(os.path.join(root_path,d),0o755)
+                    for f in files:os.chmod(os.path.join(root_path,f),0o644)
+                os.chmod(str(src),0o755)
                 self.manifest(stage,v);self.preflight(src);os.replace(str(stage),str(dest))
                 self.receipt('prepared',version=v)
             finally:

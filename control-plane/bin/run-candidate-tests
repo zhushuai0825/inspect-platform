@@ -27,8 +27,9 @@ if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
     exit 2
 fi
 
-# 创建临时data目录
+# 创建临时data目录（权限允许Docker nobody写入）
 TEMP_DATA=$(mktemp -d /tmp/preflight-data-XXXXXX)
+chmod 755 "$TEMP_DATA"  # 允许nobody遍历和读取
 trap "rm -rf '$TEMP_DATA'" EXIT
 
 # 执行测试（隔离容器）

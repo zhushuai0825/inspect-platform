@@ -499,6 +499,10 @@ class TestFullChainE2E(unittest.TestCase):
         2. 旧版本不变
         3. 服务保持运行
         """
+        # 使用失败的runner（覆盖setUp中的success runner）
+        fake_runner_fail = Path(__file__).parent / 'fixtures' / 'fake-runner-fail'
+        self.dispatcher_env['RELEASE_TEST_RUNNER_PATH'] = str(fake_runner_fail)
+        
         # 1. 创建 Git repo 并获取 commit
         commit_sha = self.create_git_bare_with_code()
         
@@ -597,6 +601,11 @@ class T(unittest.TestCase):
         # Dispatcher 应该非零退出（部署失败）
         self.assertNotEqual(result.returncode, 0,
             'Dispatcher should fail when preflight fails')
+        
+        # 验证是preflight失败阻止（不是其他错误）
+        output = result.stdout + result.stderr
+        self.assertIn('PREFLIGHT_RUNNER_FAILED', output,
+            'Should fail with PREFLIGHT_RUNNER_FAILED, not other error')
         
         # 7. 验证旧版本不变
         current = json.loads((self.release_state / 'current.json').read_text())

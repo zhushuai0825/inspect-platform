@@ -6,20 +6,19 @@ After=network.target
 [Service]
 Type=simple
 User=inspect-dispatcher
-Group=inspect-dispatcher
+Group=inspect-deploy
 WorkingDirectory=/var/lib/inspect-deploy
 
-# 控制面（只读）
-# /opt/inspect-deploy: 可信控制面脚本（release.py, dispatcher.py, runner）
-ReadOnlyPaths=/opt/inspect-deploy
+# 控制面配置（group readable）
+# /opt/inspect-deploy/config: config.json group=inspect-deploy mode=640
 
 # 应用访问（读写）
-# /opt/inspect-platform: 应用根目录（非source子目录）
-# /opt/inspect-platform/data/deploy-spool: dispatcher读写部署请求
-# /opt/inspect-platform/state: release写入版本状态
-# /var/lib/inspect-deploy: dispatcher工作目录
+# /opt/inspect-platform: 应用根目录
+# /opt/inspect-ops/state: release版本状态（实际路径）
+# /var/lib/inspect-deploy: dispatcher工作目录（work/log）
 ProtectSystem=strict
 ReadWritePaths=/opt/inspect-platform
+ReadWritePaths=/opt/inspect-ops/state
 ReadWritePaths=/var/lib/inspect-deploy
 
 # 临时目录（Git clone等）

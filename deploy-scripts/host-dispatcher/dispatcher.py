@@ -342,12 +342,31 @@ def create_artifact(source_dir, commit):
     with zipfile.ZipFile(str(artifact_path), 'w', zipfile.ZIP_DEFLATED) as z:
         for file_path in sorted(WHITELIST):
             src_file = source_dir / file_path
-            if src_file.exists() and src_file.is_file():
+            
+            # 安全检查：拒绝软链、确保在源码目录内
+            if not src_file.exists():
+                missing_count += 1
+                log('警告: 白名单文件缺失: {}'.format(file_path))
+                continue
+            
+            # 拒绝符号链接
+            if src_file.is_symlink():
+                raise Exception('源码软链不允许: {}'.format(file_path))
+            
+            # 验证规范化路径在源码目录内
+            src_resolved = src_file.resolve()
+            source_resolved = source_dir.resolve()
+            try:
+                src_resolved.relative_to(source_resolved)
+            except ValueError:
+                raise Exception('源码路径逃逸: {}'.format(file_path))
+            
+            if src_file.is_file():
                 z.write(str(src_file), 'inspect-platform/' + file_path)
                 packed_count += 1
             else:
                 missing_count += 1
-                log('警告: 白名单文件缺失: {}'.format(file_path))
+                log('警告: 白名单路径非普通文件: {}'.format(file_path))
     
     if not artifact_path.exists():
         raise Exception('制品未创建')
@@ -479,28 +498,37 @@ def execute_deploy(artifact_path, commit):
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
     
-    # 确定release路径：root无条件固定控制面，非root允许沙盒注入
-    if os.geteuid() == 0:
-        # Root生产：固定控制面，绝不允许CONFIG/env覆盖
-        release_py = Path('/opt/inspect-deploy/bin/release.py')
-        log('Root模式: 固定控制面 /opt/inspect-deploy/bin/release.py')
-    else:
-        # 非root测试沙盒：允许明确的RELEASE_CLI env注入
-        # 不允许任意注入：必须显式设置RELEASE_CLI
+    # 确定release路径：生产固定控制面，测试允许沙盒注入
+    # 生产dispatcher（非root）通过sudo调用固定root release
+    # 测试沙盒（非root）使用env注入
+    is_test_sandbox = 'RELEASE_ROOT' in CONFIG or 'RELEASE_CLI' in os.environ
+    
+    if is_test_sandbox:
+        # 测试沙盒：允许明确的RELEASE_CLI env注入
         release_py_str = os.environ.get('RELEASE_CLI')
         if not release_py_str:
-            raise Exception('Non-root mode requires explicit RELEASE_CLI env')
+            raise Exception('Test sandbox mode requires explicit RELEASE_CLI env')
         release_py = Path(release_py_str)
-        log('非root测试模式: RELEASE_CLI={}'.format(release_py))
+        use_sudo = False
+        log('测试沙盒模式: RELEASE_CLI={}'.format(release_py))
+    else:
+        # 生产模式：固定控制面，通过sudo调用
+        release_py = Path('/opt/inspect-deploy/bin/release.py')
+        use_sudo = True
+        log('生产模式: 固定控制面 /opt/inspect-deploy/bin/release.py (via sudo)')
     
     # 验证release路径安全性
     verify_trusted_path(str(release_py), 'Control plane release.py')
+    
     log('release.py 安全验证通过: {}'.format(release_py))
     
-    # 构建命令（非root测试环境不使用 sudo）
-    is_root_mode = os.geteuid() == 0
-    python_cmd = sys.executable if not is_root_mode else '/usr/bin/python3'
-    use_sudo = is_root_mode
+    # 构建命令
+    if use_sudo:
+        # 生产：通过sudo调用固定release
+        python_cmd = '/usr/bin/python3'
+    else:
+        # 测试：直接调用
+        python_cmd = sys.executable
     
     # 测试环境变量
     cmd_env = os.environ.copy()
@@ -514,8 +542,8 @@ def execute_deploy(artifact_path, commit):
         cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
     
     # Prepare
-    log('执行: prepare (env={})'.format('test' if not is_root_mode else 'prod'))
-    if not is_root_mode:
+    log('执行: prepare (env={})'.format('test' if is_test_sandbox else 'prod'))
+    if is_test_sandbox:
         log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
     cmd = []
     if use_sudo:
@@ -541,7 +569,7 @@ def execute_deploy(artifact_path, commit):
     log('prepare 成功: {}'.format(stdout[:200]))
     
     # Deploy
-    log('执行: deploy (env={})'.format('test' if not is_root_mode else 'prod'))
+    log('执行: deploy (env={})'.format('test' if is_test_sandbox else 'prod'))
     cmd = []
     if use_sudo:
         cmd.extend(['sudo', python_cmd])
