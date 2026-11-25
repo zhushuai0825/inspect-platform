@@ -1,0 +1,7 @@
+{
+  "repo_url": "https://github.com/zhushuai0825/inspect-platform.git",
+  "branch": "main",
+  "spool_dir": "/opt/inspect-platform/data/deploy-spool",
+  "work_dir": "/opt/inspect-deploy/work",
+  "log_file": "/opt/inspect-deploy/dispatcher.log"
+}

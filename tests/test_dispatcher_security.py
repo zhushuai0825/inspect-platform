@@ -255,19 +255,66 @@ class TestDispatcherReplayProtection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
             
-            # 创建请求文件
-            req_file = tmpdir / 'request-test.json'
-            req_file.write_text('{"request_id": "test"}')
+            # 临时设置 work_dir
+            original_work = dispatcher.WORK_DIR
+            dispatcher.WORK_DIR = Path(tmpdir) / 'work'
+            dispatcher.WORK_DIR.mkdir()
             
-            # 第一次领取
-            claimed = dispatcher.claim_request(req_file)
-            self.assertIsNotNone(claimed)
-            self.assertTrue(claimed.exists())
-            self.assertFalse(req_file.exists())
+            try:
+                # 创建请求文件
+                req_file = tmpdir / 'request-test.json'
+                req_file.write_text('{"request_id": "test-123"}')
+                
+                # 第一次领取
+                claimed = dispatcher.claim_request(req_file, 'test-123')
+                self.assertIsNotNone(claimed)
+                self.assertTrue(claimed.exists())
+                self.assertFalse(req_file.exists())
+                
+                # 第二次领取（失败 - 文件不存在）
+                req_file.write_text('{"request_id": "test-123"}')
+                claimed2 = dispatcher.claim_request(req_file, 'test-123')
+                self.assertIsNone(claimed2)  # 防重放生效
+                
+                # 验证 request_id 被记录
+                processed_file = dispatcher.WORK_DIR / 'processed-requests.txt'
+                self.assertTrue(processed_file.exists())
+                with open(str(processed_file)) as f:
+                    content = f.read()
+                self.assertIn('test-123', content)
+                
+            finally:
+                dispatcher.WORK_DIR = original_work
+    
+    def test_replay_prevention_across_restart(self):
+        """测试防重放跨重启（真实函数）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
             
-            # 第二次领取（失败）
-            claimed2 = dispatcher.claim_request(req_file)
-            self.assertIsNone(claimed2)
+            # 临时设置 work_dir
+            original_work = dispatcher.WORK_DIR
+            dispatcher.WORK_DIR = Path(tmpdir) / 'work'
+            dispatcher.WORK_DIR.mkdir()
+            
+            try:
+                # 第一次处理
+                req_file1 = tmpdir / 'request-restart-test.json'
+                req_file1.write_text('{"request_id": "restart-123"}')
+                claimed1 = dispatcher.claim_request(req_file1, 'restart-123')
+                self.assertIsNotNone(claimed1)
+                
+                # 模拟重启（work_dir 持久化）
+                # 再次尝试相同 request_id
+                req_file2 = tmpdir / 'request-restart-test-2.json'
+                req_file2.write_text('{"request_id": "restart-123"}')
+                claimed2 = dispatcher.claim_request(req_file2, 'restart-123')
+                
+                # 应该被拒绝（防重放）
+                self.assertIsNone(claimed2)
+                self.assertFalse(req_file2.exists())  # 已删除
+                
+            finally:
+                dispatcher.WORK_DIR = original_work
 
 
 class TestDispatcherPathSecurity(unittest.TestCase):
@@ -301,6 +348,24 @@ class TestDispatcherPathSecurity(unittest.TestCase):
             # 检测到父目录是符号链接
             with self.assertRaises(ValueError) as cm:
                 dispatcher.check_no_symlinks(child)
+            self.assertIn('符号链接', str(cm.exception))
+    
+    def test_spool_symlink_rejection(self):
+        """测试 spool 目录符号链接拒绝（真实函数）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            
+            # 创建真实 spool
+            real_spool = tmpdir / 'real-spool'
+            real_spool.mkdir()
+            
+            # 创建符号链接 spool
+            link_spool = tmpdir / 'link-spool'
+            link_spool.symlink_to(real_spool)
+            
+            # 检测符号链接（应拒绝）
+            with self.assertRaises(ValueError) as cm:
+                dispatcher.check_no_symlinks(link_spool)
             self.assertIn('符号链接', str(cm.exception))
 
 

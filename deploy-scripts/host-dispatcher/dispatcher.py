@@ -431,21 +431,48 @@ def atomic_write_result(result_path, data):
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
-def claim_request(req_file):
+def claim_request(req_file, request_id):
     """
     原子领取请求
     
     安全：
-    - 防止重复处理
-    - 使用 rename
+    - 防止重复处理（跨重启）
+    - 使用 rename + 持久化已处理ID
     """
+    # 检查已处理ID列表（跨重启防重放）
+    processed_file = safe_path_join(WORK_DIR, 'processed-requests.txt')
+    processed_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    if processed_file.exists():
+        with open(str(processed_file), 'r') as f:
+            processed_ids = set(line.strip() for line in f if line.strip())
+        
+        if request_id in processed_ids:
+            log('请求已处理（防重放）: {}'.format(request_id))
+            # 删除重复请求文件
+            try:
+                req_file.unlink()
+            except FileNotFoundError:
+                pass
+            return None
+    else:
+        processed_ids = set()
+    
+    # 原子 rename（防止并发）
     claimed_name = req_file.name.replace('request-', 'claimed-')
     claimed_path = req_file.parent / claimed_name
     
     try:
-        # 原子 rename（防止并发）
         req_file.rename(claimed_path)
+        
+        # 记录已处理ID（追加）
+        with open(str(processed_file), 'a') as f:
+            f.write(request_id + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        
         return claimed_path
+        
     except (OSError, FileNotFoundError):
         # 文件已被其他进程领取
         return None
@@ -463,10 +490,24 @@ def process_request(req_file):
     log('=' * 60)
     log('处理请求: {}'.format(req_file.name))
     
-    # 原子领取
-    claimed_file = claim_request(req_file)
+    # 读取请求（先读取 request_id）
+    try:
+        with open(str(req_file)) as f:
+            req_peek = json.load(f)
+        request_id = req_peek.get('request_id', 'unknown')
+    except Exception as e:
+        log('读取请求失败: {}'.format(e))
+        # 删除无效请求文件
+        try:
+            req_file.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    
+    # 原子领取（带防重放）
+    claimed_file = claim_request(req_file, request_id)
     if claimed_file is None:
-        log('请求已被其他进程领取')
+        log('请求已被处理或已领取')
         return
     
     result_data = {
@@ -547,6 +588,13 @@ def main():
     # 确保目录存在
     SPOOL.mkdir(parents=True, exist_ok=True, mode=0o755)
     WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    
+    # 安全检查：spool 及父目录无符号链接
+    try:
+        check_no_symlinks(SPOOL)
+    except ValueError as e:
+        log('致命错误: {}'.format(e))
+        sys.exit(1)
     
     while True:
         try:

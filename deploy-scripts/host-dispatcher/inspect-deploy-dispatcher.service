@@ -1,23 +1,28 @@
 [Unit]
-Description=Inspect Platform Deploy Dispatcher
-Documentation=https://github.com/zhushuai0825/inspect-platform
-After=network.target docker.service inspect-platform.service
-Requires=inspect-platform.service
+Description=Inspect Platform Deploy Dispatcher (Trusted Source)
+After=network.target docker.service
 
 [Service]
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/opt/inspect-deploy
 ExecStart=/usr/bin/python3 /opt/inspect-deploy/dispatcher.py
 Restart=always
-RestartSec=10
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Security
-NoNewPrivileges=false
-PrivateTmp=false
+# 安全加固
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/inspect-deploy /opt/inspect-platform/data/deploy-spool /opt/inspect-ops
+
+# 资源限制
+MemoryLimit=512M
+CPUQuota=50%
+TasksMax=50
 
 [Install]
 WantedBy=multi-user.target
