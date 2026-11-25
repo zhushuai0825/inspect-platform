@@ -1,7 +1,7 @@
 import contextlib,http.server,importlib.util,json,os,socketserver,tempfile,threading,unittest,zipfile
 from pathlib import Path
 from urllib.request import urlopen
-import release as r
+from . import release as r
 class Server(socketserver.ThreadingMixIn,http.server.HTTPServer):daemon_threads=True
 class LocalController:
     def __init__(self,root):

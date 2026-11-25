@@ -195,21 +195,45 @@ class TestFullChainE2E(unittest.TestCase):
         
         return commit_sha
     
-    def write_notification(self, request_id, commit_sha):
-        """写入通知文件（模拟 Jenkins）"""
+    def write_notification(self, commit_sha):
+        """调用真实 notify-deploy.sh 脚本写入通知（Jenkins 通知链路）"""
+        notify_script = Path(__file__).parent.parent / 'deploy-scripts' / 'jenkins' / 'notify-deploy.sh'
+        
+        # 调用真实通知脚本
+        env = os.environ.copy()
+        env['SPOOL_DIR'] = str(self.spool_dir)
+        
+        result = subprocess.run(
+            ['bash', str(notify_script), commit_sha],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        if result.returncode != 0:
+            raise AssertionError(
+                'notify-deploy.sh failed: stdout={} stderr={}'.format(
+                    result.stdout, result.stderr))
+        
+        # 查找生成的文件（脚本生成 request-*.json）
+        notify_files = list(self.spool_dir.glob('request-*.json'))
+        if not notify_files:
+            raise AssertionError('notify-deploy.sh did not create notification file')
+        
+        # 返回最新的文件
+        return max(notify_files, key=lambda p: p.stat().st_mtime)
+    
+    def write_notification_manual(self, request_id, commit_sha):
+        """手动写入通知文件（仅用于重放测试模拟攻击）"""
         notification = {
             'request_id': request_id,
             'commit': commit_sha,
             'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00'),
-            'source': 'test'
+            'source': 'test-replay'
         }
         
-        # 文件名必须以 request- 或 test-req- 开头
-        if not request_id.startswith('request-') and not request_id.startswith('test-req-'):
-            notify_file = self.spool_dir / 'test-req-{}.json'.format(request_id)
-        else:
-            notify_file = self.spool_dir / '{}.json'.format(request_id)
-        
+        notify_file = self.spool_dir / 'request-{}.json'.format(request_id)
         notify_file.write_text(json.dumps(notification))
         
         return notify_file
@@ -234,9 +258,12 @@ class TestFullChainE2E(unittest.TestCase):
         # 1. 创建 Git bare repo 并获取 commit SHA
         commit_sha = self.create_git_bare_with_code()
         
-        # 2. 写入通知
-        request_id = 'test-req-001'
-        self.write_notification(request_id, commit_sha)
+        # 2. 写入通知（调用真实 notify-deploy.sh）
+        notify_file = self.write_notification(commit_sha)
+        
+        # 获取生成的 request_id
+        notification = json.loads(notify_file.read_text())
+        request_id = notification['request_id']
         
         # 3. 创建 baseline（dispatcher 需要）
         baseline_version = 'v-baseline-e2e'
@@ -412,9 +439,10 @@ class TestFullChainE2E(unittest.TestCase):
             json.dumps({'version': baseline_version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')})
         )
         
-        # 3. 第一次：写入通知并处理
-        request_id = 'test-replay-001'
-        self.write_notification(request_id, commit_sha)
+        # 3. 第一次：调用真实 notify 脚本
+        notify_file = self.write_notification(commit_sha)
+        notification = json.loads(notify_file.read_text())
+        request_id = notification['request_id']
         
         # 运行 dispatcher 第一次
         result1 = self.run_dispatcher_once(timeout=60)
@@ -426,8 +454,8 @@ class TestFullChainE2E(unittest.TestCase):
         
         # 4. 模拟 dispatcher 进程退出（已经退出了，因为是 subprocess）
         
-        # 5. 重启 dispatcher：重新写入相同 request_id
-        self.write_notification(request_id, commit_sha)
+        # 5. 重启 dispatcher：手动写入相同 request_id（模拟重放攻击）
+        self.write_notification_manual(request_id, commit_sha)
         
         # 运行 dispatcher 第二次（新进程）
         result2 = self.run_dispatcher_once(timeout=60)
@@ -456,6 +484,124 @@ class TestFullChainE2E(unittest.TestCase):
         # 应该只有一个 request_id（防重放生效）
         self.assertEqual(len([x for x in processed_ids if x == request_id]), 1,
             'Request ID appeared multiple times in processed list')
+    
+    def test_full_chain_preflight_failure_blocks_deploy(self):
+        """
+        完整链路：Preflight 失败阻止部署
+        
+        验证候选测试失败时：
+        1. 部署被阻止
+        2. 旧版本不变
+        3. 服务保持运行
+        """
+        # 1. 创建 Git repo 并获取 commit
+        commit_sha = self.create_git_bare_with_code()
+        
+        # 2. 创建 baseline 版本（健康）
+        baseline_version = 'v1.0.0'
+        baseline_dir = self.release_state / 'releases' / baseline_version
+        baseline_dir.mkdir(parents=True)
+        
+        source_dir = baseline_dir / 'source'
+        source_dir.mkdir()
+        (source_dir / 'app.py').write_text('# baseline healthy\nprint("v1")\n')
+        (source_dir / 'core.py').write_text('# core v1\n')
+        
+        files = []
+        for p in source_dir.rglob('*'):
+            if p.is_file():
+                rel = p.relative_to(source_dir)
+                files.append({
+                    'path': str(rel),
+                    'sha256': hashlib.sha256(p.read_bytes()).hexdigest()
+                })
+        
+        manifest = {
+            'version': baseline_version,
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00'),
+            'files': files
+        }
+        (baseline_dir / 'manifest.json').write_text(json.dumps(manifest))
+        
+        # 安装 baseline 到 root
+        for p in (baseline_dir / 'source').rglob('*'):
+            if p.is_file():
+                rel = p.relative_to(baseline_dir / 'source')
+                target = self.release_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(p), str(target))
+        
+        (self.release_state / 'current.json').write_text(
+            json.dumps({'version': baseline_version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')})
+        )
+        
+        # 3. 创建新版本（包含故意失败的测试）
+        # 修改现有测试文件添加失败测试（test_platform.py 在 RUNTIME 中）
+        failing_test = self.git_work / 'tests' / 'test_platform.py'
+        failing_test.write_text('''import unittest
+class T(unittest.TestCase):
+    def test_ok(self):
+        """原有测试"""
+        pass
+    
+    def test_intentional_failure(self):
+        """故意失败的测试（验证 preflight 执行）"""
+        self.fail("Intentional preflight failure")
+''')
+        
+        subprocess.run(
+            ['git', 'add', 'tests/test_platform.py'],
+            cwd=str(self.git_work),
+            check=True
+        )
+        
+        subprocess.run(
+            ['git', 'commit', '-m', 'Add failing test'],
+            cwd=str(self.git_work),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        subprocess.run(
+            ['git', 'push', 'origin', 'main'],
+            cwd=str(self.git_work),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        # 获取新的 commit SHA
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=str(self.git_work),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        failing_commit_sha = result.stdout.strip()
+        
+        # 4. 写入通知（真实脚本）
+        notify_file = self.write_notification(failing_commit_sha)
+        
+        # 5. 运行 dispatcher
+        result = self.run_dispatcher_once(timeout=60)
+        
+        # 6. 验证部署失败（preflight 阻止）
+        # Dispatcher 应该非零退出（部署失败）
+        self.assertNotEqual(result.returncode, 0,
+            'Dispatcher should fail when preflight fails')
+        
+        # 7. 验证旧版本不变
+        current = json.loads((self.release_state / 'current.json').read_text())
+        self.assertEqual(current['version'], baseline_version,
+            'Version changed despite preflight failure')
+        
+        # 8. 验证旧版本文件完好
+        app_content = (self.release_root / 'app.py').read_text()
+        self.assertIn('v1', app_content, 'Old version files modified')
+        self.assertNotIn('v2', app_content, 'New version deployed despite failure')
 
 
 if __name__ == '__main__':

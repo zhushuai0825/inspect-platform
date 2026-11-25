@@ -28,7 +28,8 @@ fi
 REQUEST_ID="jenkins-$(date +%s)-${COMMIT:0:8}"
 
 # Spool 目录（通过挂载的 /opt/inspect-platform）
-SPOOL="/opt/inspect-platform/data/deploy-spool"
+# 测试可通过 SPOOL_DIR 环境变量覆盖
+SPOOL="${SPOOL_DIR:-/opt/inspect-platform/data/deploy-spool}"
 
 # 确保目录存在
 mkdir -p "${SPOOL}"

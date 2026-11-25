@@ -44,8 +44,8 @@ def load_config():
     
     安全：
     - 生产配置固定（repo_url, branch）不接受环境变量覆盖
-    - 测试模式必须显式设置 RELEASE_ROOT + RELEASE_STATE
-    - 测试模式下可覆盖其他路径配置
+    - 测试模式：必须非root + RELEASE_ROOT + RELEASE_STATE + 安全临时根
+    - Root 进程永远是生产模式，拒绝所有测试覆盖
     """
     config = DEFAULT_CONFIG.copy()
     
@@ -55,9 +55,10 @@ def load_config():
             file_config = json.load(f)
         config.update(file_config)
     
-    # 测试模式：必须同时设置 RELEASE_ROOT 和 RELEASE_STATE
-    # 这是唯一允许覆盖配置的方式
-    is_test_mode = ('RELEASE_ROOT' in os.environ and 
+    # 测试模式：必须非root + RELEASE_ROOT + RELEASE_STATE
+    # Root 进程永远是生产模式
+    is_test_mode = (os.geteuid() != 0 and
+                    'RELEASE_ROOT' in os.environ and 
                     'RELEASE_STATE' in os.environ)
     
     if is_test_mode:
@@ -635,6 +636,10 @@ def process_request(req_file):
     except Exception as e:
         log('✗ 请求处理失败: {}'.format(e))
         result_data['error'] = str(e)
+        # 重新抛出异常（让调用方知道失败）
+        exc_to_raise = e
+    else:
+        exc_to_raise = None
     
     finally:
         # 写入结果
@@ -647,6 +652,10 @@ def process_request(req_file):
         # 删除已处理的请求
         if claimed_file and claimed_file.exists():
             claimed_file.unlink()
+    
+    # 在清理后重新抛出异常
+    if exc_to_raise is not None:
+        raise exc_to_raise
 
 def main():
     """主循环"""
@@ -683,17 +692,24 @@ def main():
             requests = [r for r in requests if r.name.startswith('request-') or r.name.startswith('test-req-')]
             
             processed_any = False
+            failed = False
             for req_file in requests:
                 try:
                     process_request(req_file)
                     processed_any = True
                 except Exception as e:
                     log('处理请求异常: {}'.format(e))
+                    processed_any = True
+                    failed = True
             
             # 单次模式：处理完一轮后退出
             if once_mode:
                 if processed_any:
-                    log('单次处理完成，退出')
+                    if failed:
+                        log('单次处理完成，存在失败，退出码 1')
+                        sys.exit(1)
+                    else:
+                        log('单次处理完成，退出')
                 else:
                     log('未发现待处理请求，退出')
                 break
