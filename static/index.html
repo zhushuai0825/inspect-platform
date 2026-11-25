@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#101d35">
+  <title>巡检平台 · 质量控制台</title>
+  <link rel="stylesheet" href="./styles.css?v=4">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" aria-label="主导航">
+    <a href="#/dashboard" class="brand"><span class="brand-mark" aria-hidden="true">Q</span><span>巡检平台<small>QUALITY CONSOLE</small></span></a>
+    <div class="nav-label">质量管理</div>
+    <nav>
+      <a href="#/dashboard" data-nav="dashboard"><span class="nav-symbol" aria-hidden="true">01</span>工作台</a>
+      <a href="#/tasks" data-nav="tasks"><span class="nav-symbol" aria-hidden="true">02</span>巡检任务</a>
+      <a href="#/reports" data-nav="reports"><span class="nav-symbol" aria-hidden="true">03</span>报告与日志</a>
+      <a href="#/events" data-nav="events"><span class="nav-symbol" aria-hidden="true">04</span>失败与恢复</a>
+    </nav>
+    <div class="sidebar-bottom"><a href="/jenkins/" target="_blank" rel="noopener">Jenkins 控制台 <span aria-hidden="true">↗</span></a><a href="/">返回个人主页 <span aria-hidden="true">↗</span></a><div>配置受保护 · 看板公开</div></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">质量管理 <span>/</span> <strong id="current-section">工作台</strong></div><div class="topbar-meta"><span class="access-badge">免登录访问</span><span>北京时间 UTC+8</span></div></header>
+    <main id="main-content">
+      <div id="global-error" class="notice error hidden" role="alert"></div>
+      <section id="page-dashboard" class="page">
+        <div class="page-header"><div><h1>工作台</h1><p>关键路径巡检结果与执行记录</p></div><div class="actions"><button class="button" data-refresh>刷新数据</button><button class="button primary" data-run>立即巡检</button></div></div>
+        <div class="stats">
+          <article class="stat"><div class="stat-label">最近一次结果</div><div id="stat-status" class="stat-value">—</div><div id="stat-when" class="stat-note">正在读取报告</div></article>
+          <article class="stat"><div class="stat-label">最近一次通过率</div><div id="stat-rate" class="stat-value">—</div><div id="stat-counts" class="stat-note">—</div></article>
+          <article class="stat"><div class="stat-label">最近一次失败项</div><div id="stat-failed" class="stat-value">—</div><div class="stat-note">基于最新完成的巡检报告</div></article>
+          <article class="stat"><div class="stat-label">历史执行次数</div><div id="stat-runs" class="stat-value">—</div><div id="stat-failed-runs" class="stat-note">—</div></article>
+        </div>
+        <div class="schedule-strip"><div><span class="schedule-label">自动调度</span><strong>每天 09:00</strong><span>Asia/Shanghai</span></div><div>下次计划 <strong id="next-run">—</strong><span class="muted">由 Jenkins 定时触发</span></div></div>
+        <section class="panel"><div class="panel-head"><div><h2>最新检查项</h2><span id="latest-checks-meta" class="muted">等待数据</span></div><a id="latest-report-link" href="#/reports">查看完整报告 →</a></div><div class="table-wrap"><table><thead><tr><th>检查项</th><th>请求路径</th><th>状态</th><th>HTTP 状态码</th><th class="right">响应耗时</th></tr></thead><tbody id="checks-body"><tr><td colspan="5" class="empty">正在读取检查结果…</td></tr></tbody></table></div></section>
+        <section class="panel"><div class="panel-head"><h2>最近执行</h2><a href="#/reports">全部记录 →</a></div><div class="table-wrap"><table><thead><tr><th>执行时间（北京时间）</th><th>结果</th><th>通过 / 总数</th><th>失败</th><th>执行来源</th><th>Jenkins 构建</th><th class="right">操作</th></tr></thead><tbody id="recent-body"><tr><td colspan="7" class="empty">正在读取执行记录…</td></tr></tbody></table></div></section>
+      </section>
+      <section id="page-tasks" class="page hidden">
+        <div class="page-header"><div><h1>巡检任务</h1><p>查看当前持久化检查配置，由 Jenkins Pipeline 统一执行</p></div><button class="button" data-refresh>刷新数据</button></div>
+        <section class="panel task-panel"><div class="task-heading"><div><span class="type-label">HTTP 冒烟</span><h2>站点 HTTP 冒烟巡检</h2><p>内置 7 项检查已保留；新增、编辑与启停通过独立的 SSH 隧道管理入口完成。</p></div><button class="button primary" data-run>立即执行</button></div><dl class="description-grid"><div><dt>任务标识</dt><dd><code>site-http-smoke</code></dd></div><div><dt>执行引擎</dt><dd>Jenkins Pipeline</dd></div><div><dt>定时规则</dt><dd>每天 09:00 · Asia/Shanghai</dd></div><div><dt>最近完成时间</dt><dd id="task-latest-time">—</dd></div><div><dt>检查方式</dt><dd>HTTP GET · 状态码 / 正文断言</dd></div><div><dt>最近结果</dt><dd id="task-latest-status">—</dd></div></dl><div class="task-foot"><a href="/jenkins/job/site-http-smoke/" target="_blank" rel="noopener">在 Jenkins 查看任务 ↗</a><span class="muted">Jenkins 仍需单独登录</span></div></section>
+        <section class="panel"><div class="panel-head"><h2>当前检查配置</h2><span class="muted" id="task-config-count">保存后于下一轮生效</span></div><div class="table-wrap"><table><thead><tr><th>检查项 / 版本</th><th>方法 / 地址</th><th>断言规则</th><th>超时</th><th class="right">配置状态</th></tr></thead><tbody id="task-checks-body"><tr><td colspan="5" class="empty">正在读取…</td></tr></tbody></table></div></section>
+        <div class="notice">看板免登录，配置修改仅限本机管理端；公开访客不能新增、编辑或启停检查。报告详情保留执行时快照，不受后续配置影响。</div>
+        <details class="panel access-guide"><summary>如何安全管理任务配置</summary><div>在自己的电脑终端建立 SSH 隧道（使用原有服务器 SSH 登录方式）：<pre>ssh -N -L 18766:127.0.0.1:8766 root@8.146.206.64</pre>隧道连接后打开 <a href="http://127.0.0.1:18766/" target="_blank" rel="noopener">http://127.0.0.1:18766/</a>。配置端只监听服务器回环地址，不增加公网登录密码。</div></details>
+      </section>
+      <section id="page-reports" class="page hidden">
+        <div class="page-header"><div><h1>报告与日志</h1><p>查询历史执行结果，追溯失败原因与 HTTP 检查日志</p></div><button class="button" data-refresh>刷新数据</button></div>
+        <section class="panel"><div class="filter-bar"><label class="search-field"><span>运行 ID</span><input id="report-search" placeholder="搜索运行 ID" autocomplete="off"></label><label class="search-field"><span>结果</span><select id="report-filter"><option value="all">全部结果</option><option value="passed">通过</option><option value="failed">失败</option></select></label><span class="muted" id="report-count"></span></div><div class="table-wrap"><table><thead><tr><th>运行 ID / 时间</th><th>结果</th><th>通过 / 总数</th><th>失败</th><th>耗时</th><th>执行来源</th><th class="right">操作</th></tr></thead><tbody id="reports-body"><tr><td colspan="7" class="empty">正在读取历史报告…</td></tr></tbody></table></div><div class="pagination"><span class="muted" id="page-count"></span><div><button class="button small" id="prev-page">上一页</button><button class="button small" id="next-page">下一页</button></div></div></section>
+      </section>
+      <section id="page-events" class="page hidden">
+        <div class="page-header"><div><h1>失败与恢复</h1><p>仅记录状态变化，连续相同结果自动去重</p></div><button class="button" data-refresh>刷新数据</button></div>
+        <div class="notice mail-notice"><strong id="mail-status-label">邮件通知：读取状态中</strong><p id="mail-status-reason">发信服务未配置前不会发送邮件。</p><p id="mail-status-counts" class="muted"></p><p class="muted">启用或重新启用时以已有事件为基线，不补发历史；只通知此后新故障及其恢复。“已发送”表示 SMTP 已接收，不等同于收件箱送达。</p></div>
+        <section class="panel"><div class="panel-head"><h2>状态变更记录</h2><span class="muted">最近 100 条</span></div><div class="table-wrap"><table><thead><tr><th>时间（北京时间）</th><th>事件</th><th>检查项</th><th>状态码 / 原因</th><th>邮件状态</th><th>投递记录</th><th class="right">关联报告</th></tr></thead><tbody id="events-body"><tr><td colspan="7" class="empty">正在读取站内事件…</td></tr></tbody></table></div></section>
+      </section>
+      <section id="page-report" class="page hidden">
+        <a href="#/reports" class="back-link">← 返回报告列表</a>
+        <div class="page-header"><div><h1>巡检报告 <span id="report-badge"></span></h1><p id="report-id" class="mono"></p></div><a id="report-jenkins-link" class="button hidden" target="_blank" rel="noopener">Jenkins 构建日志 ↗</a></div>
+        <section class="panel report-summary"><dl class="description-grid"><div><dt>开始时间（北京时间）</dt><dd id="detail-start">—</dd></div><div><dt>完成时间（北京时间）</dt><dd id="detail-end">—</dd></div><div><dt>总耗时</dt><dd id="detail-duration">—</dd></div><div><dt>通过 / 失败 / 总数</dt><dd id="detail-counts">—</dd></div><div><dt>通过率</dt><dd id="detail-rate">—</dd></div><div><dt>执行来源</dt><dd id="detail-trigger">—</dd></div></dl></section>
+        <div class="section-heading"><h2>检查明细</h2><label><input id="failures-only" type="checkbox"> 仅看失败项</label></div><div id="check-list" class="detail-list"></div><details class="panel access-guide"><summary>执行时配置快照</summary><pre id="snapshot-content">旧版报告未记录配置快照。</pre></details>
+      </section>
+      <footer class="main-footer"><span>巡检平台 · HTTP 冒烟</span><span id="last-updated">数据来自真实巡检报告</span></footer>
+    </main>
+  </div>
+</div>
+<div id="run-status" class="run-status hidden" role="status" aria-live="polite"></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<script src="./app.js?v=4"></script>
+</body></html>

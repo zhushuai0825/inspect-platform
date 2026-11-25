@@ -1,0 +1,17 @@
+[Unit]
+Description=QA Inspector loopback-only configuration UI
+After=network.target inspect-platform.service
+[Service]
+Type=simple
+WorkingDirectory=/opt/inspect-platform
+Environment=TZ=Asia/Shanghai
+ExecStart=/usr/bin/python3 /opt/inspect-platform/admin.py
+Restart=always
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/inspect-platform/data
+[Install]
+WantedBy=multi-user.target
