@@ -1,10 +1,8 @@
 // CI/CD Pipeline for inspect-platform
-// This Jenkinsfile handles BOTH testing (for all branches/PRs) and deployment (main only)
-
-// Determine if this is a trusted main branch build (can deploy)
-def isTrustedMainBuild() {
-  return env.BRANCH_NAME == 'main' && env.CHANGE_ID == null
-}
+// SECURITY: This pipeline runs in Docker container with production mounts.
+// PRs can modify this file and execute arbitrary code.
+// Therefore: ONLY main branch builds are allowed in production Jenkins.
+// PRs MUST use separate isolated CI without production access.
 
 pipeline {
   agent any
@@ -20,20 +18,56 @@ pipeline {
     TZ = 'Asia/Shanghai'
     // Artifact filename based on commit
     ARTIFACT_NAME = "inspect-platform-${env.GIT_COMMIT?.take(8) ?: 'unknown'}.zip"
-    // Workspace-local paths (safe for all builds including PRs)
+    // Workspace-local paths
     BUILD_DIR = "${env.WORKSPACE}/build"
   }
   
   stages {
-    stage('准备') {
+    stage('安全检查') {
       steps {
         script {
           echo "=== 构建信息 ==="
           echo "分支: ${env.BRANCH_NAME}"
           echo "提交: ${env.GIT_COMMIT}"
           echo "PR: ${env.CHANGE_ID ?: '(不是PR)'}"
-          echo "受信部署: ${isTrustedMainBuild() ? '是 - 允许部署' : '否 - 仅测试'}"
           
+          // SECURITY: Reject ALL non-main builds in production Jenkins
+          // This Jenkins runs in Docker with production mounts (/opt/inspect-platform)
+          // PRs can modify Jenkinsfile and execute arbitrary code
+          // PRs MUST NOT run here - use separate isolated CI instead
+          if (env.BRANCH_NAME != 'main' || env.CHANGE_ID != null) {
+            error """
+╔════════════════════════════════════════════════════════════════╗
+║  🚨 安全拒绝：非 main 分支不允许在生产 Jenkins 构建          ║
+╚════════════════════════════════════════════════════════════════╝
+
+原因：
+1. 本 Jenkins 运行在 Docker 容器内，挂载生产目录 /opt/inspect-platform
+2. PR 可修改 Jenkinsfile 执行任意代码，访问生产凭证
+3. 容器内可能接触 data/secret.env、data/mail.env 等机密文件
+
+当前构建：
+  分支: ${env.BRANCH_NAME}
+  PR: ${env.CHANGE_ID ?: '无'}
+  
+允许条件：
+  仅 main 分支（非 PR）可在此 Jenkins 构建
+
+PR 测试方案：
+  请配置独立 CI 环境（无生产挂载、无生产凭证）
+  或使用 GitHub Actions 进行 PR 测试
+  详见 JENKINS-SETUP.md "PR 安全隔离方案" 章节
+            """
+          }
+          
+          echo "✓ 安全检查通过：main 分支构建"
+        }
+      }
+    }
+    
+    stage('准备') {
+      steps {
+        script {
           // Clean build directory
           sh "rm -rf ${env.BUILD_DIR}"
           sh "mkdir -p ${env.BUILD_DIR}"
@@ -122,9 +156,6 @@ pipeline {
     }
     
     stage('制品验证') {
-      when {
-        expression { isTrustedMainBuild() }
-      }
       steps {
         echo '=== 预部署制品校验 ==='
         sh '''#!/usr/bin/env bash
@@ -148,50 +179,58 @@ pipeline {
     }
     
     stage('部署到生产') {
-      when {
-        expression { isTrustedMainBuild() }
-      }
       steps {
         echo '=== 部署到生产服务器 ==='
         script {
-          // This stage requires production credentials and should ONLY run for main branch
-          // PRs and other branches NEVER reach here
+          // SECURITY CRITICAL:
+          // Do NOT execute ops/release.py from repo (PR-modifiable)
+          // Use FIXED host script instead: /opt/inspect-ops/deploy.sh
+          // That script will:
+          // 1. Verify source: main branch + commit signature
+          // 2. Download artifact from Jenkins (this build only)
+          // 3. Use FIXED /opt/inspect-ops/release.py (not from repo)
+          // 4. Deploy with safety checks
           
-          // Check if release ops is ready
-          def opsStatus = sh(
-            script: 'sudo python3 /opt/inspect-platform/ops/release.py status 2>&1 || true',
-            returnStdout: true
-          ).trim()
-          
-          echo "当前发布状态:\n${opsStatus}"
-          
-          // Generate version identifier
           def version = "v${new Date().format('yyyyMMdd-HHmmss')}-${env.GIT_COMMIT.take(8)}"
           echo "部署版本: ${version}"
           
-          // Prepare release (validate, test, stage)
+          // Check if host deployment script exists
+          def deployScriptExists = sh(
+            script: 'test -f /opt/inspect-ops/deploy-from-jenkins.sh && echo "yes" || echo "no"',
+            returnStdout: true
+          ).trim()
+          
+          if (deployScriptExists != 'yes') {
+            error """
+部署脚本未就绪：/opt/inspect-ops/deploy-from-jenkins.sh 不存在
+
+这是安全要求：不能直接执行 repo 中的 ops/release.py（PR 可修改）
+
+需要父代理在宿主机准备固定的部署脚本：
+  /opt/inspect-ops/deploy-from-jenkins.sh
+
+该脚本应：
+  1. 验证来源（main 分支 + commit）
+  2. 从 Jenkins artifacts 下载制品
+  3. 使用固定的 /opt/inspect-ops/release.py 部署
+  4. 不执行 repo 中的任何代码
+
+详见 JENKINS-SETUP.md "宿主部署脚本" 章节
+            """
+          }
+          
+          // Call FIXED host script (not from repo)
           sh """#!/usr/bin/env bash
             set -euo pipefail
             
-            echo "=== 准备发布 ${version} ==="
-            sudo python3 /opt/inspect-platform/ops/release.py prepare \\
-              "${BUILD_DIR}/${ARTIFACT_NAME}" \\
-              "${version}"
-            
-            echo "=== 执行部署 ${version} ==="
-            # This will:
-            # - Lock release (serialize deployments)
-            # - Check for active inspections/emails (abort if busy)
-            # - Stop services
-            # - Backup current data to /root/backups (private)
-            # - Install new code (atomic replace)
-            # - Start services
-            # - Run health checks
-            # - Auto-rollback if health check fails
-            sudo python3 /opt/inspect-platform/ops/release.py deploy "${version}"
-            
-            echo "=== 部署完成 ==="
-            sudo python3 /opt/inspect-platform/ops/release.py status
+            # This script is on HOST, not in repo
+            # Jenkins container must have access via mount or docker exec
+            /opt/inspect-ops/deploy-from-jenkins.sh \\
+              --version "${version}" \\
+              --commit "${env.GIT_COMMIT}" \\
+              --branch "${env.BRANCH_NAME}" \\
+              --artifact "${env.WORKSPACE}/${BUILD_DIR}/${ARTIFACT_NAME}" \\
+              --artifact-sha256 "${env.WORKSPACE}/${BUILD_DIR}/${ARTIFACT_NAME}.sha256"
           """
         }
       }
@@ -202,7 +241,6 @@ pipeline {
         failure {
           echo '✗ 部署失败 - 应已自动回滚到前一版本'
           echo '详细日志: /opt/inspect-ops/state/audit.jsonl'
-          sh 'sudo python3 /opt/inspect-platform/ops/release.py status || true'
         }
       }
     }

@@ -1,507 +1,612 @@
 # Jenkins CI/CD 配置指南
 
-本文档说明如何在服务器 Jenkins 上配置仓库的自动化测试与部署流程。
+**⚠️ 重要安全说明**：本文档已针对真实 Docker 容器拓扑和安全隔离要求完全重写。
 
-## 概览
+---
 
-本平台使用 **Jenkins** 作为核心 CI/CD 执行引擎（非 GitHub Actions），实现：
+## 安全架构说明
 
-1. **自动化测试（CI）**：所有分支/PR 提交自动触发测试
-2. **自动化部署（CD）**：仅受信 `main` 分支通过测试后允许部署
-3. **安全隔离**：PR 和 fork 只能运行测试，无法接触部署密钥或生产环境
-4. **自动回滚**：部署失败时健康检查自动回滚到前一版本
+### 现实约束
 
-## 两个独立任务
+1. **Jenkins 在 Docker 容器内运行**
+   - 容器挂载宿主 `/opt/inspect-platform`（生产代码和数据）
+   - 容器内可能接触 `data/secret.env`、`data/mail.env` 等机密文件
+   - 容器内 `sudo`/`systemctl` 与宿主不是同一回事
 
-### 1. `inspect-platform-ci` - 仓库 CI/CD 流水线（新建）
+2. **公开仓库的 PR 可修改 Jenkinsfile**
+   - PR 可执行任意代码（包括读取挂载的生产凭证）
+   - `when` 条件不构成安全边界（可被 PR 删除或绕过）
+   - **因此：PR 不能在生产 Jenkins 上构建**
 
-- **用途**：自动化测试所有提交，自动部署 main 分支
-- **Jenkinsfile**: 仓库根目录 `Jenkinsfile`
-- **触发方式**：Git 轮询（建议 2 分钟）
-- **分支策略**：
-  - 所有分支和 PR：运行语法检查、自动化测试、打包制品
-  - **仅** `main` 分支（非 PR）：额外执行制品验证和生产部署
-- **权限要求**：需要 sudo 权限执行 `/opt/inspect-platform/ops/release.py`
+3. **资源限制**
+   - 服务器内存仅 1.8GB
+   - 无法同时运行独立的隔离 CI 环境和生产 Jenkins
 
-### 2. `site-http-smoke` - 日常巡检任务（保持现有）
+### 安全决策
 
-- **用途**：每日 09:00 执行 HTTP 冒烟巡检
-- **Jenkinsfile**: `jenkins/Jenkinsfile`
-- **触发方式**：cron 定时 + 手动触发
-- **与 CI/CD 无关**：这是业务监控任务，不是代码发布流水线
+**本方案采用的安全策略**：
+
+✅ **仅 main 分支在生产 Jenkins 构建**
+- Jenkinsfile 第一阶段明确拒绝所有非 main 分支
+- 拒绝所有 Pull Request（无论来自 origin 还是 fork）
+
+✅ **部署使用宿主固定脚本**
+- 不执行 repo 中的 `ops/release.py`（PR 可修改）
+- 调用宿主 `/opt/inspect-ops/deploy-from-jenkins.sh`（固定，不受 repo 影响）
+- 该脚本验证来源后，使用宿主固定的 `/opt/inspect-ops/release.py`
+
+✅ **PR 测试方案**（三选一）：
+
+**方案 A**：手动本地测试（推荐，零成本）
+```bash
+# 开发者在本地运行测试
+git checkout <pr-branch>
+PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+**方案 B**：GitHub Actions（免费，但需配置）
+- 使用 GitHub Actions 在隔离环境测试 PR
+- 无法访问生产服务器或凭证
+- 配置文件：`.github/workflows/test.yml`（本轮未提供）
+
+**方案 C**：Jenkins 独立 Agent（需额外配置）
+- 配置无生产挂载的独立 Jenkins agent
+- 仅运行测试，不执行部署
+- 需要父代理配置（见"附录：独立 CI Agent 配置"）
+
+---
+
+## 核心流程
+
+### main 分支更新（自动部署）
+
+```
+1. 推送到 main 分支（或合并 PR）
+   ↓
+2. Jenkins Git 轮询检测（2 分钟内）
+   ↓
+3. 安全检查：验证分支 == main && 非 PR
+   ↓
+4. 语法检查 + 自动化测试（67 项）
+   ↓
+5. 打包制品（.zip + .sha256）
+   ↓
+6. 制品验证（哈希、大小）
+   ↓
+7. 调用宿主部署脚本
+   ↓ (固定脚本执行)
+8. 验证来源 → 下载制品 → 调用固定 release.py
+   ↓
+9. 部署（停服、备份、安装、健康检查）
+   ↓
+10. 成功 ✓ 或 失败自动回滚 ↻
+```
+
+### PR 提交（禁止在生产 Jenkins）
+
+```
+1. 提交 PR
+   ↓
+2. Jenkins 轮询检测（如配置扫描 PR）
+   ↓
+3. 安全检查：分支 != main 或是 PR
+   ↓
+4. ❌ 立即失败，显示安全拒绝消息
+   ↓
+5. PR 作者需在本地运行测试
+   或配置 GitHub Actions（方案 B）
+```
 
 ---
 
 ## 配置步骤
 
-### 步骤 1：准备 Jenkins 插件
+### 步骤 1：准备宿主部署脚本
 
-确保安装以下插件（服务器 Jenkins 通常已有）：
+**⚠️ 必须先完成此步骤，否则部署阶段会失败**
 
-- **Git Plugin** - 仓库克隆与轮询
-- **Pipeline Plugin** - Jenkinsfile 支持
-- **Credentials Plugin** - 凭证管理
+```bash
+# 1. 创建 ops 目录（如不存在）
+sudo mkdir -p /opt/inspect-ops/state
+sudo chmod 700 /opt/inspect-ops/state
 
-### 步骤 2：创建 Git 凭证（如未配置）
+# 2. 从当前生产代码复制固定的 release.py
+sudo cp /opt/inspect-platform/ops/release.py /opt/inspect-ops/release.py
+sudo chmod 755 /opt/inspect-ops/release.py
 
-Jenkins 需要 GitHub 仓库的只读访问权限：
+# 3. 创建部署脚本（从 repo 模板）
+sudo cp /opt/inspect-platform/deploy/deploy-from-jenkins.sh /opt/inspect-ops/deploy-from-jenkins.sh
+sudo chmod 755 /opt/inspect-ops/deploy-from-jenkins.sh
 
-1. 进入 Jenkins → Manage Jenkins → Credentials
-2. 添加凭证（类型：Username with password 或 SSH Key）
-   - **用户名/密码**：GitHub 用户名 + Personal Access Token (PAT)
-     - Token 权限：`repo`（私有仓库）或 `public_repo`（公开仓库）
-   - **SSH 密钥**：或使用 SSH deploy key
-3. 记录凭证 ID（例如：`github-inspect-platform`）
+# 4. 验证脚本可执行
+ls -lh /opt/inspect-ops/deploy-from-jenkins.sh
+ls -lh /opt/inspect-ops/release.py
+```
 
-**重要**：此凭证仅用于 Git 克隆，不涉及部署密钥。
+**重要**：
+- `/opt/inspect-ops/release.py` 是固定版本，不会被 PR 修改
+- 未来需要升级部署工具时，需人工评审后手动复制
+- 不能让 Jenkins 自动替换这些固定脚本
 
-### 步骤 3：创建 CI/CD 流水线任务
+### 步骤 2：配置 Jenkins 访问宿主脚本
 
-#### 3.1 创建新任务
+**方案 A**：Docker 挂载（推荐）
 
-1. Jenkins 首页 → New Item
-2. 名称：`inspect-platform-ci`
-3. 类型：**Pipeline** 或 **Multibranch Pipeline**（推荐）
-4. 点击 OK
+如果 Jenkins 容器启动命令可修改：
 
-#### 3.2 推荐配置：Multibranch Pipeline
+```bash
+# 在 docker run 添加挂载
+docker run ... \
+  -v /opt/inspect-platform:/opt/inspect-platform:rw \
+  -v /opt/inspect-ops:/opt/inspect-ops:ro \  # 只读挂载
+  ...
+```
 
-**优势**：自动发现所有分支和 PR，每个独立构建，安全隔离。
+重启 Jenkins 容器后，容器内可访问 `/opt/inspect-ops/deploy-from-jenkins.sh`
 
-配置项：
+**方案 B**：docker exec（备选）
 
-- **Branch Sources** → Add source → Git
-  - **Project Repository**: `https://github.com/zhushuai0825/inspect-platform.git`
-  - **Credentials**: 选择步骤 2 创建的凭证
-  - **Behaviors**:
-    - ✓ Discover branches
-    - ✓ Discover pull requests from origin
-    - ✓ Discover pull requests from forks (Strategy: Merging the pull request with the current target branch revision)
+如果无法修改容器挂载，修改 Jenkinsfile 部署阶段：
 
-- **Build Configuration**
-  - **Mode**: by Jenkinsfile
-  - **Script Path**: `Jenkinsfile`（仓库根目录）
+```groovy
+sh '''
+  # 从宿主执行部署脚本
+  docker exec -i <jenkins-container-name> \
+    /opt/inspect-ops/deploy-from-jenkins.sh \
+    --version "${VERSION}" \
+    --commit "${GIT_COMMIT}" \
+    --branch "${BRANCH_NAME}" \
+    --artifact "${WORKSPACE}/${BUILD_DIR}/${ARTIFACT_NAME}" \
+    --artifact-sha256 "${WORKSPACE}/${BUILD_DIR}/${ARTIFACT_NAME}.sha256"
+'''
+```
 
-- **Scan Repository Triggers**
-  - ✓ **Periodically if not otherwise run**
-    - **Interval**: `2 minutes`（或按需调整，建议 2-5 分钟）
-  
-  > **为什么用轮询而非 Webhook？**
-  > - 避免 HTTP webhook 明文传输 secret
-  > - 无需公网接口接收 GitHub POST 请求
-  > - 轮询周期可明确（例如 2 分钟），而非依赖外部通知
-  > - 如后续需要实时触发，可改用 GitHub App with JWT 或配置防火墙保护的 webhook endpoint
+需要将 `<jenkins-container-name>` 替换为实际容器名。
 
-- **Orphaned Item Strategy**
-  - Days to keep old items: `7`
-  - Max # of old items to keep: `20`
+### 步骤 3：创建 Jenkins 任务
 
-#### 3.3 备选配置：单 Pipeline
+**重要**：仅配置 main 分支，不扫描 PR。
 
-如不需要自动发现分支/PR，可用简单 Pipeline：
+#### 方案 A：单分支 Pipeline（推荐，简单）
 
+1. Jenkins 首页 → **New Item**
+2. 名称：`inspect-platform-deploy`
+3. 类型：**Pipeline**
+4. 配置：
+
+**Pipeline Definition**:
 - **Definition**: Pipeline script from SCM
 - **SCM**: Git
   - **Repository URL**: `https://github.com/zhushuai0825/inspect-platform.git`
-  - **Credentials**: 选择步骤 2 凭证
-  - **Branch Specifier**: `*/main`（仅主分支）或 `*/*`（所有分支）
+  - **Credentials**: 添加 GitHub 只读凭证（PAT 或 SSH Key）
+  - **Branch Specifier**: `*/main`（**仅 main 分支**）
 - **Script Path**: `Jenkinsfile`
-- **Poll SCM**: `H/2 * * * *`（每 2 分钟轮询）
 
-### 步骤 4：配置 sudo 权限（部署阶段必需）
+**Build Triggers**:
+- ✓ **Poll SCM**
+  - **Schedule**: `H/2 * * * *`（每 2 分钟轮询）
 
-CI/CD 流水线的**部署阶段**需要执行 `sudo python3 /opt/inspect-platform/ops/release.py`。
+**保存**
 
-#### 4.1 确定 Jenkins 运行用户
+#### 方案 B：Multibranch Pipeline（不推荐，会扫描 PR）
 
-```bash
-ps aux | grep jenkins
-# 或检查 Docker 容器运行用户
-docker inspect <jenkins-container> | grep User
+如使用 Multibranch，必须配置过滤：
+
+**Branch Sources** → **Behaviors**:
+- ✓ **Filter by name (with regular expression)**
+  - **Regular expression**: `^main$`（仅匹配 main）
+- ✗ **不要**勾选 "Discover pull requests"
+
+这样 Jenkins 只扫描 main 分支，忽略所有 PR。
+
+### 步骤 4：首次构建测试
+
+1. 进入 Jenkins → `inspect-platform-deploy`
+2. 点击 **Build Now**（如是 Multibranch，点击 **Scan Repository Now**）
+3. 查看 **Console Output**
+
+**预期阶段**：
+```
+✓ 安全检查 - 验证 main 分支
+✓ 准备 - 清理工作空间
+✓ 语法检查 - Python/JavaScript/Bash
+✓ 自动化测试 - 67 项测试
+✓ 打包制品 - 生成 .zip 和 .sha256
+✓ 制品验证 - 哈希校验
+✓ 部署到生产 - 调用宿主脚本
 ```
 
-通常为 `jenkins` 用户（如运行在 Docker 中可能是 `root` 或自定义用户）。
+**如部署阶段失败**：
+- 检查 `/opt/inspect-ops/deploy-from-jenkins.sh` 是否存在
+- 检查 Jenkins 容器是否可访问该脚本（挂载或 docker exec）
+- 检查 `/opt/inspect-ops/release.py` 是否存在
 
-#### 4.2 授予最小 sudo 权限
-
-假设 Jenkins 用户为 `jenkins`，编辑 sudoers：
-
-```bash
-sudo visudo -f /etc/sudoers.d/jenkins-deploy
-```
-
-添加以下内容（**仅授权必需的命令**）：
-
-```sudoers
-# Allow Jenkins to run release.py for inspect-platform deployment
-jenkins ALL=(root) NOPASSWD: /usr/bin/python3 /opt/inspect-platform/ops/release.py status
-jenkins ALL=(root) NOPASSWD: /usr/bin/python3 /opt/inspect-platform/ops/release.py prepare *
-jenkins ALL=(root) NOPASSWD: /usr/bin/python3 /opt/inspect-platform/ops/release.py deploy *
-jenkins ALL=(root) NOPASSWD: /usr/bin/python3 /opt/inspect-platform/ops/release.py rollback *
-```
-
-保存并验证：
+### 步骤 5：验证部署结果
 
 ```bash
-# 以 jenkins 用户测试（无密码提示）
-sudo -u jenkins sudo python3 /opt/inspect-platform/ops/release.py status
-```
-
-**安全说明**：
-- 仅授权 `/opt/inspect-platform/ops/release.py`，不允许任意命令
-- 参数使用 `*` 通配符（版本号动态生成）
-- `NOPASSWD` 避免交互式密码提示（流水线无法输入）
-
-### 步骤 5：首次运行与验证
-
-#### 5.1 触发首次扫描
-
-- Multibranch Pipeline: 点击 "Scan Repository Now"
-- 单 Pipeline: 点击 "Build Now"
-
-#### 5.2 检查构建结果
-
-**测试阶段（所有分支/PR）**：
-- ✓ 语法检查通过
-- ✓ 自动化测试通过（67 项单元/集成测试）
-- ✓ 制品打包成功（生成 `.zip` 和 `.sha256`）
-
-**部署阶段（仅 main 分支）**：
-- ✓ 制品验证通过
-- ✓ 调用 `ops/release.py prepare` 成功（校验、临时测试）
-- ✓ 调用 `ops/release.py deploy` 成功（停服、备份、安装、健康检查）
-- ✓ 若健康检查失败，自动回滚到前一版本
-
-#### 5.3 查看部署日志
-
-```bash
-# 服务器上查看发布状态
-sudo python3 /opt/inspect-platform/ops/release.py status
+# 查看部署状态
+python3 /opt/inspect-ops/release.py status
 
 # 查看审计日志
-sudo cat /opt/inspect-ops/state/audit.jsonl | tail -20
+sudo cat /opt/inspect-ops/state/audit.jsonl | tail -5 | python3 -m json.tool
 
-# 查看最新版本
+# 检查服务健康
+sudo systemctl status inspect-platform inspect-admin inspect-worker inspect-mail
+curl http://127.0.0.1:8765/qa/api/health
+
+# 访问公开看板
+curl -I http://8.146.206.64/qa/
+```
+
+---
+
+## PR 测试方案详解
+
+### 方案 A：本地测试（推荐）
+
+**优势**：零成本，不需要额外配置
+
+**开发者工作流**：
+
+```bash
+# 1. 创建 PR 分支
+git checkout -b feature/new-check
+
+# 2. 修改代码
+vim core.py
+
+# 3. 本地运行测试
+PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+# 4. 语法检查
+python3 -m py_compile app.py core.py admin.py worker.py notifications.py
+node --check static/app.js admin-static/app.js
+bash -n inspect_run.sh
+
+# 5. 测试通过后提交 PR
+git push -u origin feature/new-check
+# 在 GitHub 创建 PR → main
+```
+
+**代码审查者**：在批准 PR 前，要求提供测试通过的截图或日志。
+
+### 方案 B：GitHub Actions（需配置）
+
+**优势**：自动化，PR 自动触发测试
+
+**配置步骤**：
+
+1. 在 repo 创建 `.github/workflows/test.yml`：
+
+```yaml
+name: Test
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.6'
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+      
+      - name: Syntax check
+        run: |
+          python3 -m py_compile app.py core.py admin.py worker.py notifications.py
+          node --check static/app.js admin-static/app.js
+          bash -n inspect_run.sh
+      
+      - name: Run tests
+        run: |
+          PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+2. 推送到 main 分支
+3. 此后所有 PR 自动触发测试
+
+**注意**：GitHub Actions 在隔离环境运行，无法访问生产服务器。
+
+### 方案 C：Jenkins 独立 Agent（高级）
+
+**仅当需要在 Jenkins 测试 PR 时使用**
+
+见"附录：独立 CI Agent 配置"。
+
+---
+
+## 安全边界确认
+
+### ✅ 安全措施
+
+1. **main 分支构建**
+   - Jenkinsfile 第一阶段拒绝所有非 main 分支
+   - 错误消息明确说明原因和替代方案
+
+2. **固定部署脚本**
+   - 宿主 `/opt/inspect-ops/deploy-from-jenkins.sh` 不受 repo 影响
+   - 宿主 `/opt/inspect-ops/release.py` 不受 PR 修改
+
+3. **来源验证**
+   - 部署脚本验证 `--branch main`
+   - 验证制品完整性（SHA256）
+
+4. **审计日志**
+   - 所有部署记录在 `/opt/inspect-ops/state/audit.jsonl`
+   - 包含版本、提交、时间、结果
+
+### ❌ 已知限制
+
+1. **PR 无自动测试**
+   - 生产 Jenkins 拒绝 PR 构建（安全要求）
+   - 需要本地测试或配置 GitHub Actions
+
+2. **短暂维护窗口**
+   - 部署时停服 20-40 秒（非零停机）
+   - 不支持蓝绿部署（资源限制）
+
+3. **手动升级部署工具**
+   - `/opt/inspect-ops/release.py` 需人工更新
+   - 不能自动从 repo 同步（安全考虑）
+
+---
+
+## 维护操作
+
+### 查看部署历史
+
+```bash
+# 当前版本
+python3 /opt/inspect-ops/release.py status
+
+# 审计日志（最近 10 条）
+sudo cat /opt/inspect-ops/state/audit.jsonl | tail -10 | python3 -m json.tool
+
+# 可用版本
 ls -lh /opt/inspect-ops/state/releases/
 ```
 
----
-
-## 分支与 PR 策略
-
-### 允许部署的条件
-
-**必须同时满足**：
-1. 分支名为 `main`
-2. 不是 Pull Request（`CHANGE_ID` 为空）
-
-### PR 和其他分支的行为
-
-- ✓ 自动触发构建
-- ✓ 运行完整测试
-- ✓ 打包制品（归档为 Jenkins artifact）
-- ✗ **不执行部署阶段**（`when` 条件阻止）
-- ✗ **无法访问生产凭证**（`data/secret.env` 不在工作空间）
-
-### 合并到 main 的流程
-
-1. 开发者提交 PR
-2. Jenkins 自动测试 PR（提供测试反馈）
-3. 代码审查通过后合并到 `main`
-4. Jenkins 检测到 `main` 更新（2 分钟内）
-5. 重新运行测试
-6. **测试通过后自动部署到生产**
-
----
-
-## 制品与版本追溯
-
-### 制品内容
-
-每次构建生成：
-- `inspect-platform-<commit>.zip` - 部署包（包含 `inspect-platform/` 前缀）
-- `inspect-platform-<commit>.zip.sha256` - 完整性校验
-
-### 版本号规则
-
-自动生成格式：`v<日期>-<时间>-<commit>`
-
-示例：`v20261125-143022-a1b2c3d4`
-
-### 完整性验证
-
-部署前自动校验：
-1. SHA256 哈希匹配
-2. 制品大小合理（10KB - 4MB）
-3. 文件白名单检查（`ops/release.py` 的 `RUNTIME` 列表）
-4. Python 语法预检
-5. 自动化测试（临时环境，无生产凭证）
-
-### 回滚到历史版本
-
-#### 方法 1：通过 Jenkins 重新部署旧 commit
-
-1. Jenkins → inspect-platform-ci → main 分支
-2. 找到要恢复的历史构建（包含对应 commit）
-3. 点击 "Replay" 或 "Rebuild"
-
-#### 方法 2：服务器手动回滚
+### 手动回滚
 
 ```bash
-# 查看可用版本
-sudo python3 /opt/inspect-platform/ops/release.py status
+# 查看可回滚的版本
+python3 /opt/inspect-ops/release.py status
 
-# 回滚到已知版本
-sudo python3 /opt/inspect-platform/ops/release.py rollback v20261125-143022-a1b2c3d4
+# 回滚到指定版本
+python3 /opt/inspect-ops/release.py rollback v20261125-150833-07450bb
 ```
 
-**限制**：只能回滚到 `prepare` 过的版本（已校验和测试）。
+### 升级部署工具
 
----
-
-## 维护窗口与并发控制
-
-### 维护窗口
-
-部署过程会**短暂停止服务**（非零停机）：
-
-1. 检查活动巡检和待发邮件（有则中止）
-2. 停止 `inspect-platform`、`inspect-admin`、`inspect-worker`、`inspect-mail` 服务
-3. 备份运行数据到 `/root/backups/inspect-release-data-<version>/`（私有）
-4. 原子替换源代码文件
-5. 启动服务并运行健康检查
-6. 失败则自动回滚并重启旧版本
-
-**典型停机时长**：20-40 秒
-
-**注意**：
-- 破坏性数据库迁移不自动回滚（需人工评审）
-- 不覆盖 `data/` 目录（持久数据与源码隔离）
-
-### 并发控制
-
-**Pipeline 级别**：
-- `disableConcurrentBuilds()` - 同一任务串行执行
-
-**部署级别**：
-- `ops/release.py` 使用 flock 文件锁
-- 多个部署请求自动排队（后者等待或失败）
-
-### 冲突处理
-
-如遇 `RELEASE_BUSY` 错误：
-```bash
-# 查看锁状态
-sudo python3 /opt/inspect-platform/ops/release.py status
-
-# 确认无部署进程后（若异常中断）
-sudo python3 /opt/inspect-platform/ops/release.py recover
-```
-
----
-
-## 安全与权限设计
-
-### 凭证隔离
-
-| 凭证类型 | 位置 | 访问权限 | 用途 |
-|---------|-----|---------|------|
-| GitHub 只读凭证 | Jenkins Credentials | Jenkins 进程 | 克隆仓库 |
-| Jenkins API Token | `data/secret.env` | root 只读（600） | 更新 `site-http-smoke` 任务定义 |
-| SMTP 密码 | `data/mail.env` | root 只读（600） | 邮件通知 |
-| 部署权限 | sudoers | Jenkins 用户（限定命令） | 执行 release.py |
-
-### PR 安全保障
-
-**PR 构建的限制**：
-1. 工作空间隔离（临时目录，无生产数据）
-2. 测试环境变量 `QA_DATA_DIR` 指向临时目录
-3. 不继承生产环境变量（`data/secret.env` 不可见）
-4. `when` 条件阻止部署阶段执行
-5. 无 sudo 权限（即使尝试也被拒绝）
-
-**Fork PR 的额外保护**：
-- Multibranch Pipeline 的 "Discover pull requests from forks" 策略使用 "Merging" 模式
-- Fork 的 Jenkinsfile 修改**不会**被信任执行（使用目标分支的 Jenkinsfile）
-- 建议启用 Jenkins "Suppress automatic SCM triggering" for untrusted authors
-
-### 生产凭证管理
-
-**绝不**将以下内容提交到仓库：
-- `data/secret.env` - Jenkins API Token
-- `data/mail.env` - SMTP 密码
-- `data/platform.db` - 数据库文件
-- `/root/backups/*` - 私有备份
-
-`.gitignore` 已正确配置排除这些文件。
-
----
-
-## 监控与日志
-
-### Jenkins 构建日志
-
-- **位置**：Jenkins UI → 任务 → 构建历史 → Console Output
-- **内容**：测试输出、部署步骤、回滚记录
-
-### 服务器部署日志
+**⚠️ 谨慎操作**：需人工评审新版 `ops/release.py`
 
 ```bash
-# 审计日志（所有发布事件）
-sudo cat /opt/inspect-ops/state/audit.jsonl | jq .
+# 1. 审查新版本变更
+git diff <old-commit> <new-commit> ops/release.py
 
-# 当前状态
-sudo python3 /opt/inspect-platform/ops/release.py status
+# 2. 在测试环境验证（如有）
+cd /tmp
+cp /opt/inspect-platform/ops/release.py ./release-new.py
+python3 release-new.py --help
 
-# 最近部署
-sudo tail -f /var/log/syslog | grep inspect
+# 3. 更新固定副本
+sudo cp /opt/inspect-platform/ops/release.py /opt/inspect-ops/release.py
+sudo chmod 755 /opt/inspect-ops/release.py
 
-# 应用服务日志
-sudo journalctl -u inspect-platform -u inspect-admin -u inspect-worker -u inspect-mail -f
+# 4. 验证
+python3 /opt/inspect-ops/release.py status
 ```
 
-### 健康检查端点
+### 紧急部署（绕过 Jenkins）
 
-部署后自动验证：
-- http://127.0.0.1:8765/qa/api/health
-- http://127.0.0.1:8766/api/health（管理端，需 loopback）
-- 个人主页、简历、运维入口、Jenkins 认证边界
+**仅紧急情况使用**：
 
-失败则自动回滚。
+```bash
+# 1. 从 main 分支创建制品
+cd /tmp
+git clone --depth 1 --branch main https://github.com/zhushuai0825/inspect-platform.git
+cd inspect-platform
+zip -r ../inspect-platform-emergency.zip .
+
+# 2. 手动部署
+python3 /opt/inspect-ops/release.py prepare ../inspect-platform-emergency.zip vEmergency
+python3 /opt/inspect-ops/release.py deploy vEmergency
+```
 
 ---
 
 ## 故障排查
 
-### 问题 1：轮询未触发构建
+### 问题 1：安全检查失败（非 main 分支）
+
+**症状**：
+```
+🚨 安全拒绝：非 main 分支不允许在生产 Jenkins 构建
+```
+
+**原因**：这是预期行为，PR 不能在生产 Jenkins 构建。
+
+**解决**：
+- PR：在本地运行测试，或配置 GitHub Actions
+- 其他分支：合并到 main 后自动部署
+
+### 问题 2：部署脚本不存在
+
+**症状**：
+```
+部署脚本未就绪：/opt/inspect-ops/deploy-from-jenkins.sh 不存在
+```
+
+**原因**：未完成步骤 1 的准备工作。
+
+**解决**：
+```bash
+sudo mkdir -p /opt/inspect-ops
+sudo cp /opt/inspect-platform/deploy/deploy-from-jenkins.sh /opt/inspect-ops/
+sudo cp /opt/inspect-platform/ops/release.py /opt/inspect-ops/
+sudo chmod 755 /opt/inspect-ops/*.sh /opt/inspect-ops/release.py
+```
+
+### 问题 3：Jenkins 容器无法访问宿主脚本
+
+**症状**：
+```
+/opt/inspect-ops/deploy-from-jenkins.sh: No such file or directory
+```
+
+**原因**：容器未挂载 `/opt/inspect-ops`
+
+**解决**：
+
+**方案 A**：修改容器挂载（需重启容器）
+```bash
+docker stop <jenkins-container>
+docker run ... -v /opt/inspect-ops:/opt/inspect-ops:ro ...
+```
+
+**方案 B**：使用 docker exec
+修改 Jenkinsfile 部署阶段为：
+```groovy
+sh '''
+  docker exec <jenkins-container-name> \
+    /opt/inspect-ops/deploy-from-jenkins.sh ...
+'''
+```
+
+### 问题 4：健康检查失败
+
+**症状**：
+```
+部署失败 - 应已自动回滚到前一版本
+```
 
 **检查**：
 ```bash
-# Jenkins → 任务 → Git Polling Log
-# 查看最近轮询记录和 Git 仓库访问日志
+# 查看服务状态
+sudo systemctl status inspect-platform inspect-admin inspect-worker inspect-mail
+
+# 查看日志
+sudo journalctl -u inspect-platform -n 50
+
+# 手动测试健康端点
+curl http://127.0.0.1:8765/qa/api/health
 ```
 
 **常见原因**：
-- 凭证过期或无效
-- 网络连接问题（防火墙）
-- 轮询周期配置错误
+- 代码语法错误（Python import 失败）
+- 端口被占用
+- 权限问题（data/ 目录）
 
-**解决**：
-- 重新生成 GitHub PAT 并更新 Jenkins 凭证
-- 测试网络连通性：`curl https://github.com/zhushuai0825/inspect-platform.git`
-
-### 问题 2：部署阶段权限拒绝
-
-**错误**：`sudo: a password is required`
-
-**原因**：sudoers 未正确配置
-
-**解决**：参考步骤 4 配置 `NOPASSWD`
-
-### 问题 3：健康检查失败，但服务正常
-
-**原因**：健康检查超时或端点变更
-
-**解决**：
-1. 检查 `ops/release.py` 的 `health_check()` 实现
-2. 调整超时或增加重试
-3. 手动验证端点：`curl http://127.0.0.1:8765/qa/api/health`
-
-### 问题 4：回滚失败
-
-**错误**：`rollback_failed` 记录在 `audit.jsonl`
-
-**应对**：
-1. 不要继续自动部署
-2. 查看 `/root/backups/inspect-release-data-<version>/` 备份
-3. 手动恢复源代码：
-   ```bash
-   sudo cp -r /opt/inspect-ops/state/releases/<known-version>/source/* /opt/inspect-platform/
-   sudo systemctl restart inspect-platform inspect-admin inspect-worker inspect-mail
-   ```
-
-### 问题 5：RELEASE_BUSY 锁无法释放
-
-**原因**：发布进程异常中断
-
-**解决**：
-```bash
-# 确认无 release.py 进程运行
-ps aux | grep release.py
-
-# 恢复事务状态
-sudo python3 /opt/inspect-platform/ops/release.py recover
-```
+**恢复**：
+- 自动回滚应已恢复服务
+- 修复代码后重新推送 main 分支
 
 ---
 
-## 后续改进建议
+## 附录：独立 CI Agent 配置
 
-### 可选增强（本次未实现）
+**仅当需要在 Jenkins 测试 PR 时使用（可选）**
 
-1. **实时 Webhook 触发**
-   - 配置 GitHub Webhook → Jenkins Generic Webhook Trigger
-   - 需要防火墙规则保护 Jenkins endpoint
-   - 或使用 GitHub App with JWT 避免明文 secret
+### 要求
 
-2. **多环境部署**
-   - 增加 staging 环境测试
-   - main → staging 自动部署 → 手动批准 → production
+- 独立机器或容器（无生产挂载）
+- 无法访问生产服务器或凭证
+- 仅运行测试，不执行部署
 
-3. **蓝绿部署**
-   - 零停机切换（需双实例和负载均衡）
-   - 当前为单实例，有短暂维护窗口
+### 配置步骤
 
-4. **破坏性迁移支持**
-   - 数据库 schema 版本管理
-   - 迁移脚本与回滚脚本成对
+1. **准备 Agent 机器**
 
-5. **通知集成**
-   - Jenkins Email Extension 插件
-   - 部署成功/失败通知到邮件/Slack/企业微信
+```bash
+# 在独立机器上安装 Java
+sudo apt-get update
+sudo apt-get install -y openjdk-11-jre python3 nodejs
+```
+
+2. **在 Jenkins Master 添加 Node**
+
+Jenkins → Manage Jenkins → Nodes → New Node
+- **Name**: `ci-test-agent`
+- **Type**: Permanent Agent
+- **Labels**: `ci-test`
+- **Remote root directory**: `/home/jenkins/agent`
+- **Launch method**: Launch agent via SSH
+
+3. **创建独立 CI Pipeline**
+
+新建任务 `inspect-platform-test-pr`：
+
+**Pipeline Script**:
+```groovy
+pipeline {
+  agent { label 'ci-test' }  // 使用隔离 agent
+  
+  stages {
+    stage('测试') {
+      steps {
+        checkout scm
+        sh 'PYTHONPATH=. python3 -m unittest discover -s tests -p "test_*.py" -v'
+      }
+    }
+  }
+}
+```
+
+**Branch Sources** → **Behaviors**:
+- ✓ Discover pull requests from origin
+- ✓ Filter by name (exclude main)
+
+4. **配置 Git 轮询**
+
+**Scan Repository Triggers**:
+- ✓ Periodically if not otherwise run: `5 minutes`
 
 ---
 
 ## 检查清单
 
-部署前确认：
+### 初始配置
 
-- [ ] Jenkins 安装 Git、Pipeline 插件
-- [ ] 创建 GitHub 只读凭证（PAT 或 SSH Key）
-- [ ] 创建 `inspect-platform-ci` Multibranch Pipeline 任务
-- [ ] 配置 Git 轮询（2 分钟周期）
-- [ ] 配置 sudoers 授权 `jenkins` 用户执行 `release.py`
-- [ ] 首次扫描仓库，验证 main 分支构建成功
-- [ ] 检查部署日志，确认服务健康
-- [ ] 测试 PR 构建（仅测试，不部署）
-- [ ] 验证回滚功能（可选，建议在 staging 测试）
+- [ ] 创建 `/opt/inspect-ops/deploy-from-jenkins.sh`
+- [ ] 创建 `/opt/inspect-ops/release.py`（从当前生产复制）
+- [ ] 配置 Jenkins 访问宿主脚本（挂载或 docker exec）
+- [ ] 创建 Jenkins 任务（仅 main 分支）
+- [ ] 配置 Git 轮询（2 分钟）
+- [ ] 首次构建验证
 
-部署后验证：
+### PR 测试方案（三选一）
 
-- [ ] 访问 http://8.146.206.64/qa/ 看板正常
-- [ ] 新报告使用新代码生成
-- [ ] 管理端 SSH 隧道访问正常（http://127.0.0.1:18766/）
-- [ ] Jenkins 认证边界保持
-- [ ] 旧报告内容未变（配置快照隔离）
-- [ ] 查看 `audit.jsonl` 确认部署记录
-- [ ] 保留原 `site-http-smoke` 任务定义和调度
+- [ ] 方案 A：开发者本地测试（零成本）
+- [ ] 方案 B：配置 GitHub Actions（需创建 workflow）
+- [ ] 方案 C：配置 Jenkins 独立 Agent（需额外资源）
+
+### 安全验证
+
+- [ ] 非 main 分支构建被拒绝
+- [ ] PR 构建被拒绝
+- [ ] 部署使用宿主固定脚本（不执行 repo 代码）
+- [ ] 审计日志记录部署事件
 
 ---
+
+## 文档更新日期
+
+2026-11-25（安全复核后完全重写）
 
 ## 联系与支持
 
-- **文档更新日期**：2026-11-25
-- **仓库**：https://github.com/zhushuai0825/inspect-platform
-- **服务器路径**：`/opt/inspect-platform`
-- **运维工具路径**：`/opt/inspect-ops`（如已安装）
-- **问题反馈**：提交 GitHub Issue 或联系维护人员
-
----
-
-**重要提醒**：
-
-1. **不要**在非服务器环境运行 `ops/release.py deploy`（会失败且无意义）
-2. **不要**手动修改 `/opt/inspect-ops/state/releases/` 下的版本目录（破坏校验）
-3. **不要**将 `data/secret.env`、`data/mail.env` 或私有备份提交到仓库
-4. **不要**在生产时段触发部署（建议维护窗口：凌晨或低峰期）
-5. **始终**在合并到 main 前通过 PR 完成测试和代码审查
+- **仓库**: https://github.com/zhushuai0825/inspect-platform
+- **服务器**: http://8.146.206.64/qa/
+- **问题反馈**: 提交 GitHub Issue

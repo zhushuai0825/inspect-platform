@@ -56,10 +56,15 @@ ssh -N -L 18766:127.0.0.1:8766 root@8.146.206.64
 本项目已接入 GitHub 版本管理和 Jenkins 自动化流水线：
 
 - **仓库**：https://github.com/zhushuai0825/inspect-platform
-- **自动化测试**：所有分支和 PR 提交自动触发语法检查、单元测试、集成测试
+- **自动化测试**：main 分支提交自动触发语法检查、67 项单元/集成测试
 - **自动化部署**：`main` 分支通过测试后自动部署到生产服务器
-- **安全隔离**：PR 和 fork 只能运行测试，无法接触部署密钥或生产环境
+- **安全隔离**：生产 Jenkins 仅构建 main 分支，PR 在独立环境测试（本地或 GitHub Actions）
 - **自动回滚**：部署失败时健康检查自动回滚到前一版本
+
+**重要安全说明**：
+- Jenkins 在 Docker 容器内运行，挂载生产目录
+- PR 可修改 Jenkinsfile，因此不能在生产 Jenkins 构建
+- 部署使用宿主固定脚本（`/opt/inspect-ops/deploy-from-jenkins.sh`），不执行 repo 代码
 
 详细配置步骤见 [`JENKINS-SETUP.md`](JENKINS-SETUP.md)。
 
