@@ -1,0 +1,18 @@
+#!/bin/bash
+# 测试夹具：模拟成功的runner
+# 用于测试preflight调用隔离runner
+
+CANDIDATE_SRC="${1:?Missing candidate source}"
+
+# 验证候选源码目录存在
+if [ ! -d "$CANDIDATE_SRC" ]; then
+    echo "ERROR: Candidate source not found: $CANDIDATE_SRC" >&2
+    exit 1
+fi
+
+# 模拟runner执行测试
+echo "Runner: Executing tests for $CANDIDATE_SRC"
+echo "Runner: All tests passed"
+
+# 返回成功
+exit 0

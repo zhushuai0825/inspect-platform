@@ -73,17 +73,87 @@ class Manager:
             if p.is_symlink() or not p.is_file() or digest(p)!=h:raise ReleaseError('CHECKSUM_MISMATCH')
         return dest/'source'
     def preflight(self,src):
-        # 测试模式：跳过 preflight（环境变量控制）
-        if os.environ.get('RELEASE_TEST_SKIP_PREFLIGHT'):
-            return
+        """
+        Preflight候选测试（隔离runner）
         
+        生产安全：
+        - 调用固定可信隔离runner（不直接执行候选代码）
+        - Runner路径：/opt/inspect-deploy/bin/run-candidate-tests
+        - 验证runner存在、owner=root、mode不可组写/他人写
+        - Fail-closed：runner不存在/不可信/失败均阻止部署
+        - 禁止：root/当前UID直接执行候选unittest
+        - 禁止：通过env/候选覆盖runner路径
+        
+        测试模式（RELEASE_TEST_RUNNER_PATH）：
+        - 仅限非root环境
+        - 仅用于测试依赖注入
+        - 不影响生产root逻辑
+        """
+        # 语法检查（快速失败）
         for name in sorted(RUNTIME):
-            if name.endswith('.py') and (src/name).exists():ast.parse((src/name).read_text(),filename=name)
-        with tempfile.TemporaryDirectory(prefix='inspect-release-preflight-') as data:
-            env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','TZ':'Asia/Shanghai','QA_DATA_DIR':data,'PYTHONPATH':str(src),'PYTHONDONTWRITEBYTECODE':'1'}
-            p=subprocess.run([sys.executable,'-m','unittest','discover','-s','tests','-p','test_*.py'],cwd=str(src),env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120)
-            # Never persist arbitrary candidate output; it may contain sensitive data.
-            if p.returncode:raise ReleaseError('PREFLIGHT_TEST_FAILED')
+            if name.endswith('.py') and (src/name).exists():
+                ast.parse((src/name).read_text(),filename=name)
+        
+        # 确定runner路径
+        # 生产：固定路径，不可覆盖
+        # 测试：仅非root可用env override
+        if os.geteuid() == 0:
+            # Root生产模式：固定runner路径，拒绝env覆盖
+            runner_path = Path('/opt/inspect-deploy/bin/run-candidate-tests')
+        else:
+            # 非root测试模式：允许依赖注入
+            runner_path = Path(os.environ.get(
+                'RELEASE_TEST_RUNNER_PATH',
+                '/opt/inspect-deploy/bin/run-candidate-tests'
+            ))
+        
+        # 验证runner存在
+        if not runner_path.exists():
+            raise ReleaseError('PREFLIGHT_RUNNER_MISSING')
+        
+        # 验证runner安全性
+        # 生产（root）：owner必须是root（uid=0）
+        # 测试（非root）：owner检查放宽（允许当前用户）
+        # mode始终不可组写(020)或他人写(002)
+        try:
+            stat_info = runner_path.stat()
+            
+            # Owner检查
+            if os.geteuid() == 0:
+                # Root生产模式：runner必须root-owned
+                if stat_info.st_uid != 0:
+                    raise ReleaseError('PREFLIGHT_RUNNER_NOT_ROOT_OWNED')
+            else:
+                # 非root测试模式：runner可以是当前用户owned
+                # （实际生产由root生产模式保证）
+                pass
+            
+            # Mode检查（生产和测试都要求）
+            if stat_info.st_mode & 0o022:  # 检查组写(020)或他人写(002)
+                raise ReleaseError('PREFLIGHT_RUNNER_WORLD_WRITABLE')
+        except OSError as e:
+            raise ReleaseError('PREFLIGHT_RUNNER_STAT_FAILED')
+        
+        # 调用隔离runner
+        # 传递候选源码目录
+        # 不直接执行候选代码
+        try:
+            proc = subprocess.run(
+                [str(runner_path), str(src)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=180  # 3分钟超时
+            )
+        except subprocess.TimeoutExpired:
+            raise ReleaseError('PREFLIGHT_RUNNER_TIMEOUT')
+        except OSError as e:
+            raise ReleaseError('PREFLIGHT_RUNNER_EXEC_FAILED')
+        
+        # Fail-closed: runner返回非0阻止部署
+        if proc.returncode != 0:
+            # 不持久化候选输出（可能包含敏感数据）
+            raise ReleaseError('PREFLIGHT_RUNNER_FAILED')
     def prepare(self,archive,v):
         with self.lock():
             dest=self.path(v)

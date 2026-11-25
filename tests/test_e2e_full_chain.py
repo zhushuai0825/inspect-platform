@@ -61,6 +61,11 @@ class TestFullChainE2E(unittest.TestCase):
         self.dispatcher_env['RELEASE_ROOT'] = str(self.release_root)
         self.dispatcher_env['RELEASE_STATE'] = str(self.release_state)
         
+        # Preflight runner路径（使用fake runner）
+        fake_runner = Path(__file__).parent / 'fixtures' / 'fake-runner-success'
+        if fake_runner.exists():
+            self.dispatcher_env['RELEASE_TEST_RUNNER_PATH'] = str(fake_runner)
+        
         # Release 环境变量
         self.release_env = os.environ.copy()
         self.release_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(
