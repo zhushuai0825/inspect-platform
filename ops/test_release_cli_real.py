@@ -81,10 +81,11 @@ class TestReleaseCLIReal(unittest.TestCase):
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_text(content)
         
-        # 创建秘密文件
+        # 创建秘密文件和数据
         (self.sandbox_root / 'data').mkdir(exist_ok=True)
         (self.sandbox_root / 'data' / 'secret.env').write_text('SECRET=test123\n')
         (self.sandbox_root / 'data' / 'mail.env').write_text('SMTP_PASSWORD=fake\n')
+        (self.sandbox_root / 'data' / 'platform.db').write_bytes(b'fake-db-content')
         
         # 环境变量
         self.env = os.environ.copy()
@@ -232,110 +233,212 @@ class TestReleaseCLIReal(unittest.TestCase):
         self.assertIn('SECRET=test123', secret_content)
     
     def test_deploy_rollback_on_health_failure_real(self):
-        """测试健康检查失败自动回滚（真实 subprocess）"""
-        # 创建 baseline 并启动旧版本健康服务
-        baseline_version = 'v-baseline-rb-cli'
+        """测试健康检查失败自动回滚（真实 subprocess + 真实 HTTP）"""
+        # 1. 创建并部署旧版本（健康成功）
+        baseline_version = 'v-baseline-20261125'
         baseline_dir = self.sandbox_state / 'releases' / baseline_version
         baseline_dir.mkdir(parents=True)
         (baseline_dir / 'source').mkdir()
         
+        # 复制源码到旧版本
         for path in self.sandbox_root.rglob('*'):
-            if path.is_file() and 'data' not in path.parts:
+            if path.is_file() and 'data' not in path.parts and not path.name.startswith('.'):
                 rel_path = path.relative_to(self.sandbox_root)
                 target = baseline_dir / 'source' / rel_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(path), str(target))
         
+        # 创建旧版本 manifest
         files = {}
         for p in (baseline_dir / 'source').rglob('*'):
             if p.is_file():
                 rel = str(p.relative_to(baseline_dir / 'source'))
                 files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
         
-        manifest = {
+        old_manifest = {
             'version': baseline_version,
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00'),
             'files': files
         }
-        (baseline_dir / 'manifest.json').write_text(json.dumps(manifest))
+        (baseline_dir / 'manifest.json').write_text(json.dumps(old_manifest))
         
+        # 设置旧版本为当前版本
         (self.sandbox_state / 'current.json').write_text(
             json.dumps({'version': baseline_version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')})
         )
         
-        # 启动旧版本健康服务（创建端口文件）
-        (self.sandbox_root / '.test_http_port').write_text('18765')
+        # 记录旧版本数据 hash（用于验证回滚后不变）
+        old_secret_hash = hashlib.sha256((self.sandbox_root / 'data' / 'secret.env').read_bytes()).hexdigest()
+        old_db_hash = hashlib.sha256((self.sandbox_root / 'data' / 'platform.db').read_bytes()).hexdigest()
         
-        # Prepare 新版本
-        archive = self.create_test_archive()
-        new_version = 'v20261125-cli-fail'
+        # 记录旧版本源码 hash
+        old_app_hash = hashlib.sha256((self.sandbox_root / 'app.py').read_bytes()).hexdigest()
         
-        self.run_release_cli('prepare', str(archive), new_version)
+        # 2. 创建会失败的新版本 archive
+        # 在 app.py 中包含 'unhealthy' 标记
+        archive_fail = Path(tempfile.mktemp(suffix='.zip', prefix='release-fail-'))
         
-        # Deploy 前删除端口文件（模拟新版本健康失败）
-        # 注意：deploy 会先 stop（删除文件），然后 start_front（创建文件）
-        # 我们需要在 start_front 后删除，但这需要监控或延迟
-        # 简化：在 deploy 过程中，新版本不创建端口文件（通过不设置环境）
+        with zipfile.ZipFile(str(archive_fail), 'w') as z:
+            for path in self.sandbox_root.rglob('*'):
+                if path.is_file() and 'data' not in path.parts:
+                    arcname = 'inspect-platform/' + str(path.relative_to(self.sandbox_root))
+                    
+                    # 修改 app.py 包含 unhealthy
+                    if path.name == 'app.py':
+                        # 创建临时文件
+                        tmpf = Path(tempfile.mktemp())
+                        tmpf.write_text('# app unhealthy\n')
+                        z.write(str(tmpf), arcname)
+                        tmpf.unlink()
+                    else:
+                        z.write(str(path), arcname)
         
-        # 实际上 LocalController 的 start_front 会创建端口文件
-        # 我们需要在 health 检查前删除它
-        # 这需要并发或 hook，测试简化为：
-        # 修改源码使其在第一次健康检查时删除端口文件
+        new_version = 'v20261125-fail'
         
-        # 更简单的方法：创建一个会失败的版本
-        # 在 install 后手动删除端口文件
+        # 3. Prepare 新版本
+        self.run_release_cli('prepare', str(archive_fail), new_version)
         
-        # 由于测试复杂性，我们接受 deploy 会成功创建端口文件
-        # 然后在健康检查时删除它
+        # 清理
+        archive_fail.unlink()
         
-        # 实际测试：先正常 deploy，然后测试回滚失败场景
-        # 这里简化：假设新版本健康检查会失败（端口文件不存在）
+        # 4. Deploy 新版本（应触发健康失败并自动回滚）
+        result = self.run_release_cli('deploy', new_version, should_fail=True)
         
-        # Deploy（应失败并回滚）
-        cmd = [sys.executable, str(RELEASE_PY), 'deploy', new_version]
-        
-        result = subprocess.run(
-            cmd,
-            env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        
-        # 由于 LocalController 会创建端口文件，健康检查应该成功
-        # 我们需要另一种方式触发失败
-        # 修改测试：准备阶段就不创建完整文件，导致健康失败
-        
-        # 临时解决：这个测试验证正常 deploy，单独测试回滚
-        # 应该成功
-        if result.returncode == 0:
-            self.skipTest('健康检查成功，需要单独测试回滚场景')
-        
-        # 应失败并回滚
+        # 5. 验证 deploy 失败
         self.assertNotEqual(result.returncode, 0)
-        output = result.stdout + result.stderr
         
-        # 必须回滚成功
-        self.assertIn('ROLLED_BACK', output)
+        # 6. 解析输出
+        output_lines = result.stdout.strip().split('\n')
+        deploy_result = None
+        for line in output_lines:
+            try:
+                deploy_result = json.loads(line)
+                break
+            except:
+                continue
         
-        # 验证状态恢复
+        self.assertIsNotNone(deploy_result, 'Deploy result not found')
+        self.assertFalse(deploy_result.get('ok', True))
+        
+        # 7. 验证明确回滚成功代码（不接受 ROLLBACK_FAILED）
+        self.assertEqual(deploy_result['code'], 'DEPLOY_FAILED_ROLLED_BACK')
+        
+        # 8. 验证 current.json 仍为旧版本
         current = json.loads((self.sandbox_state / 'current.json').read_text())
         self.assertTrue(
-            current['version'].startswith('before-') or
-            current['version'] == baseline_version
+            current['version'] == baseline_version or
+            current['version'].startswith('before-')
         )
         
-        # 验证 transaction 标记为 rolled_back
+        # 9. 验证旧源码恢复（app.py hash 不变）
+        restored_app_hash = hashlib.sha256((self.sandbox_root / 'app.py').read_bytes()).hexdigest()
+        self.assertEqual(restored_app_hash, old_app_hash)
+        
+        # 10. 验证旧版本 HTTP 服务已启动（端口文件存在，证明 start_front 被调用）
+        # 注意：由于 release.py 进程已退出，HTTP server（daemon thread）也已停止
+        # 但端口文件存在证明 restore() 调用了 controller.start_front()
+        port_file = self.sandbox_root / '.test_http_port'
+        self.assertTrue(port_file.exists(), 'Old version HTTP port file missing (start_front not called)')
+        
+        # 11. 验证临时数据/秘密完整保留（hash 不变）
+        restored_secret_hash = hashlib.sha256((self.sandbox_root / 'data' / 'secret.env').read_bytes()).hexdigest()
+        self.assertEqual(restored_secret_hash, old_secret_hash)
+        
+        restored_db_hash = hashlib.sha256((self.sandbox_root / 'data' / 'platform.db').read_bytes()).hexdigest()
+        self.assertEqual(restored_db_hash, old_db_hash)
+        
+        # 12. 验证 transaction 标记为 rolled_back
         tx = json.loads((self.sandbox_state / 'transaction.json').read_text())
         self.assertEqual(tx['phase'], 'rolled_back')
+    
+    def test_deploy_rollback_failure_real(self):
+        """测试回滚失败场景（真实 subprocess + 真实 HTTP）"""
+        # 1. 创建并 deploy 旧版本（app.py 包含 unhealthy，会导致回滚失败）
         
-        # 验证秘密文件保留
-        secret_content = (self.sandbox_root / 'data' / 'secret.env').read_text()
-        self.assertIn('SECRET=test123', secret_content)
+        # 创建会失败的旧版本 archive
+        archive_old_fail = Path(tempfile.mktemp(suffix='.zip', prefix='release-old-fail-'))
         
-        # 验证旧版本健康恢复
-        port_file = self.sandbox_root / '.test_http_port'
-        self.assertTrue(port_file.exists())
+        with zipfile.ZipFile(str(archive_old_fail), 'w') as z:
+            for path in self.sandbox_root.rglob('*'):
+                if path.is_file() and 'data' not in path.parts:
+                    arcname = 'inspect-platform/' + str(path.relative_to(self.sandbox_root))
+                    
+                    if path.name == 'app.py':
+                        tmpf = Path(tempfile.mktemp())
+                        tmpf.write_text('# app unhealthy old\n')
+                        z.write(str(tmpf), arcname)
+                        tmpf.unlink()
+                    else:
+                        z.write(str(path), arcname)
+        
+        old_version = 'v-baseline-fail'
+        
+        # Prepare 旧版本
+        self.run_release_cli('prepare', str(archive_old_fail), old_version)
+        archive_old_fail.unlink()
+        
+        # 设置旧版本为 baseline (手动)
+        (self.sandbox_state / 'current.json').write_text(
+            json.dumps({'version': old_version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S+08:00')})
+        )
+        
+        # 安装旧版本到 root（这样 snapshot 会包含 unhealthy 的 app.py）
+        old_release_dir = self.sandbox_state / 'releases' / old_version / 'source'
+        for p in old_release_dir.rglob('*'):
+            if p.is_file():
+                rel = p.relative_to(old_release_dir)
+                target = self.sandbox_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(p), str(target))
+        
+        # 2. 创建会失败的新版本 archive
+        archive_fail = Path(tempfile.mktemp(suffix='.zip', prefix='release-fail2-'))
+        
+        with zipfile.ZipFile(str(archive_fail), 'w') as z:
+            for path in self.sandbox_root.rglob('*'):
+                if path.is_file() and 'data' not in path.parts:
+                    arcname = 'inspect-platform/' + str(path.relative_to(self.sandbox_root))
+                    
+                    if path.name == 'app.py':
+                        tmpf = Path(tempfile.mktemp())
+                        tmpf.write_text('# app unhealthy\n')
+                        z.write(str(tmpf), arcname)
+                        tmpf.unlink()
+                    else:
+                        z.write(str(path), arcname)
+        
+        new_version = 'v20261125-fail2'
+        
+        # 3. Prepare 新版本
+        self.run_release_cli('prepare', str(archive_fail), new_version)
+        
+        archive_fail.unlink()
+        
+        # 3. Deploy 新版本（应触发健康失败，回滚也失败）
+        result = self.run_release_cli('deploy', new_version, should_fail=True)
+        
+        # 4. 验证 deploy 失败
+        self.assertNotEqual(result.returncode, 0)
+        
+        # 5. 解析输出
+        output_lines = result.stdout.strip().split('\n')
+        deploy_result = None
+        for line in output_lines:
+            try:
+                deploy_result = json.loads(line)
+                break
+            except:
+                continue
+        
+        self.assertIsNotNone(deploy_result, 'Deploy result not found')
+        self.assertFalse(deploy_result.get('ok', True))
+        
+        # 6. 验证回滚失败代码（fail closed）
+        self.assertEqual(deploy_result['code'], 'ROLLBACK_FAILED_MANUAL_RECOVERY_REQUIRED')
+        
+        # 7. 验证 transaction 标记为 rollback_failed
+        tx = json.loads((self.sandbox_state / 'transaction.json').read_text())
+        self.assertEqual(tx['phase'], 'rollback_failed')
 
 
 def run_tests():

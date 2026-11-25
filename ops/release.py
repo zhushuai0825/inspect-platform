@@ -244,6 +244,8 @@ def main():
                     self.runlock = None
                     self.calls = []
                     self.http_port = None
+                    self.http_server = None
+                    self.http_thread = None
                 
                 def systemctl(self, *args):
                     self.calls.append(('systemctl',) + args)
@@ -271,20 +273,52 @@ def main():
                     self._start_http()
                 
                 def _start_http(self):
-                    """启动临时 HTTP 健康服务"""
-                    import socket
-                    # 找一个可用端口
-                    sock = socket.socket()
-                    sock.bind(('127.0.0.1', 0))
-                    self.http_port = sock.getsockname()[1]
-                    sock.close()
+                    """启动真实 loopback HTTP 服务"""
+                    import http.server
+                    import socketserver
+                    import threading
+                    
+                    # 检查是否应该失败（通过标记文件在 root/.test_health_fail_VERSION）
+                    # 读取当前 app.py 判断是否应该失败
+                    # 简化：通过读取 app.py 内容判断
+                    should_fail = False
+                    app_py = self.root / 'app.py'
+                    if app_py.exists():
+                        content = app_py.read_text()
+                        should_fail = 'unhealthy' in content
+                    
+                    class HealthHandler(http.server.BaseHTTPRequestHandler):
+                        def do_GET(handler_self):
+                            if should_fail:
+                                handler_self.send_response(503)
+                                handler_self.end_headers()
+                                handler_self.wfile.write(b'unhealthy')
+                            else:
+                                handler_self.send_response(200)
+                                handler_self.end_headers()
+                                handler_self.wfile.write(b'ok')
+                        def log_message(handler_self, *args):
+                            pass
+                    
+                    self.http_server = socketserver.TCPServer(('127.0.0.1', 0), HealthHandler)
+                    self.http_port = self.http_server.server_address[1]
                     
                     # 记录端口
                     port_file = self.root / '.test_http_port'
                     port_file.write_text(str(self.http_port))
+                    
+                    # 启动服务线程
+                    self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+                    self.http_thread.start()
                 
                 def _stop_http(self):
                     """停止 HTTP 服务"""
+                    if self.http_server:
+                        self.http_server.shutdown()
+                        self.http_server.server_close()
+                        self.http_server = None
+                        self.http_thread = None
+                    
                     port_file = self.root / '.test_http_port'
                     if port_file.exists():
                         port_file.unlink()
@@ -300,13 +334,19 @@ def main():
                             raise ReleaseError('HEALTH_CHECK_FAILED')
                         self.http_port = int(port_file.read_text().strip())
                     
-                    # 简化：检查端口文件存在即为健康
-                    # 真实实现应发送 HTTP 请求
-                    port_file = self.root / '.test_http_port'
-                    if not port_file.exists():
+                    # 发送真实 HTTP 请求
+                    import urllib.request
+                    try:
+                        url = 'http://127.0.0.1:{}{}'.format(self.http_port, path)
+                        resp = urllib.request.urlopen(url, timeout=2)
+                        body = resp.read()
+                        if resp.status != status:
+                            raise ReleaseError('HEALTH_CHECK_FAILED')
+                        if contains and contains not in body:
+                            raise ReleaseError('HEALTH_CHECK_FAILED')
+                        return body
+                    except Exception:
                         raise ReleaseError('HEALTH_CHECK_FAILED')
-                    
-                    return b'ok'
                 
                 def health(self):
                     self.calls.append(('health',))
