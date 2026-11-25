@@ -1,0 +1,51 @@
+#!/bin/bash
+# 固定可信隔离runner调用脚本
+# Owner: root:root 755
+# 安装位置: /opt/inspect-deploy/bin/run-candidate-tests
+#
+# 功能：在隔离容器中执行候选测试
+# 安全：非root、只读候选、临时data、network=none、资源限制
+
+set -euo pipefail
+
+# 参数
+CANDIDATE_SRC="${1:?Missing candidate source directory}"
+
+# 验证候选源码目录
+if [ ! -d "$CANDIDATE_SRC" ]; then
+    echo "ERROR: Candidate source not found: $CANDIDATE_SRC" >&2
+    exit 1
+fi
+
+# Runner镜像
+RUNNER_IMAGE="inspect-platform-runner:v1"
+
+# 检查runner镜像存在
+if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
+    echo "ERROR: Runner image not found: $RUNNER_IMAGE" >&2
+    echo "Please build: docker build -f /opt/inspect-deploy/runner/Dockerfile.runner -t $RUNNER_IMAGE /opt/inspect-deploy/runner/" >&2
+    exit 2
+fi
+
+# 创建临时data目录
+TEMP_DATA=$(mktemp -d /tmp/preflight-data-XXXXXX)
+trap "rm -rf '$TEMP_DATA'" EXIT
+
+# 执行测试（隔离容器）
+docker run --rm \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    --network=none \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    --pids-limit=100 \
+    --memory=384m \
+    --cpus=0.5 \
+    --user=nobody:nogroup \
+    -v "${CANDIDATE_SRC}:/candidate:ro" \
+    -v "${TEMP_DATA}:/data:rw" \
+    -e "QA_DATA_DIR=/data" \
+    "$RUNNER_IMAGE" \
+    /candidate
+
+# 返回码：0=成功，非0=失败
