@@ -53,19 +53,22 @@ ssh -N -L 18766:127.0.0.1:8766 root@8.146.206.64
 
 ## 版本管理与 CI/CD
 
-本项目已接入 GitHub 版本管理和 Jenkins 自动化流水线：
+本项目已接入 GitHub 版本管理和 Jenkins 自动化部署：
 
 - **仓库**：https://github.com/zhushuai0825/inspect-platform
-- **自动化测试**：main 分支提交自动触发语法检查、67 项单元/集成测试
-- **自动化部署**：`main` 分支通过测试后自动部署到生产服务器
-- **安全隔离**：生产 Jenkins 仅构建 main 分支，PR 在独立环境测试（本地或 GitHub Actions）
-- **自动回滚**：部署失败时健康检查自动回滚到前一版本
+- **PR 测试**：GitHub Actions 自动运行 67 项测试（隔离环境）
+- **main 部署**：Jenkins Freestyle Job 自动部署到生产服务器
+  - 隔离测试容器（无生产挂载、无 Docker socket、384MB 限额）
+  - 固定部署脚本（宿主机，不受 repo 控制）
+  - 健康检查 + 自动回滚
+- **安全隔离**：控制器不执行任何仓库代码，所有构建在固定脚本控制下进行
 
-**重要安全说明**：
-- Jenkins 在 Docker 容器内运行，挂载生产目录
-- PR 可修改 Jenkinsfile，因此不能在生产 Jenkins 构建
-- 部署使用宿主固定脚本（`/opt/inspect-ops/deploy-from-jenkins.sh`），不执行 repo 代码
+**架构说明**：
+- Jenkins 容器：root (uid=0)，挂载生产目录和 Docker socket
+- 控制器 2 执行器，无 agent/cloud
+- 资源限制：809MB 可用，测试容器 384MB 限额
+- 不使用 Pipeline（Freestyle Job + 固定脚本）
 
-详细配置步骤见 [`JENKINS-SETUP.md`](JENKINS-SETUP.md)。
+详细架构见 [`JENKINS-ARCHITECTURE.md`](JENKINS-ARCHITECTURE.md)。
 
 邮件已于2026-11-25 14:28:18（Asia/Shanghai）按用户授权启用，使用同一获授权账号收发，仅通知未来新故障及其恢复，不补发历史。未发测试信，不能据认证成功宣称邮件已送达。详情见 MAIL-ACTIVATION.md。

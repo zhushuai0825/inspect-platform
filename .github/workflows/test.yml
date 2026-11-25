@@ -1,0 +1,54 @@
+name: PR Test
+
+# PR 测试在 GitHub Actions 运行（隔离环境）
+# Jenkins 资源不足（仅 809MB 可用），仅用于 main 分支部署
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]  # 仅用于验证，实际部署由 Jenkins 执行
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python 3.6
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.6'
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Python syntax check
+        run: |
+          python3 -m py_compile app.py core.py admin.py worker.py notifications.py
+          python3 -m py_compile deploy/update_job.py ops/release.py ops/test_release.py
+      
+      - name: JavaScript syntax check
+        run: |
+          node --check static/app.js
+          node --check admin-static/app.js
+      
+      - name: Bash syntax check
+        run: |
+          bash -n inspect_run.sh
+      
+      - name: Run application tests
+        run: |
+          export PYTHONPATH=.
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+      
+      - name: Run ops tests
+        working-directory: ops
+        run: |
+          export PYTHONPATH=..
+          python3 -m unittest test_release -v
