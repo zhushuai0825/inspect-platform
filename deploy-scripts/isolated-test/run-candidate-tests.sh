@@ -13,7 +13,11 @@
 # - 资源限制（384MB memory, 0.5 CPU, 100 pids）
 # - 只读源码
 # - 临时数据目录
-# - 固定镜像（python:3.6-slim）
+# - 确定可复现镜像：python:3.11-slim（带 Git）
+#
+# 注意：
+# - python:3.6-slim 已 EOL，使用 3.11
+# - 需要 Git（测试依赖）
 
 set -euo pipefail
 
@@ -53,29 +57,37 @@ echo "启动隔离测试容器: $CONTAINER_NAME"
 # Docker 安全选项：
 # --read-only: 容器文件系统只读
 # --tmpfs /tmp: 临时文件系统（noexec, nosuid）
-# --network none: 无网络访问
+# --network none: 无网络访问（回环测试通过 QA_DATA_DIR 临时 HTTP）
 # --cap-drop ALL: 移除所有 capabilities
 # --security-opt no-new-privileges: 禁止提权
 # --memory 384m: 内存限制
 # --cpus 0.5: CPU 限制
 # --pids-limit 100: 进程数限制
-# --user 1000:1000: 非 root 用户
+# --user 65534:65534: 非 root 用户（nobody）
+
+# 注意：使用 python:3.11（非 slim）以包含 Git
+# python:3.11-slim 不含 Git，会导致测试失败
+# network none 验证可行（用户证据：回环 HTTP 测试通过）
 
 docker run --rm \
   --name "$CONTAINER_NAME" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /var/tmp:rw,noexec,nosuid,size=16m \
   --network none \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --memory 384m \
   --cpus 0.5 \
   --pids-limit 100 \
-  --user 1000:1000 \
+  --user 65534:65534 \
   -v "${SOURCE_DIR}:/src:ro" \
   -v "${DATA_DIR}:/data:rw" \
+  -e QA_DATA_DIR=/data \
+  -e PYTHONPATH=/src \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -w /src \
-  python:3.6-slim \
+  python:3.11 \
   python3 -m unittest discover -s tests -p "test_*.py" -v
 
 EXIT_CODE=$?
