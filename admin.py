@@ -4,11 +4,18 @@
 import json
 import os
 import re
+import sys
 from urllib.parse import urlsplit
 import core
 from app import Handler, ThreadingHTTPServer
 
 STATIC=os.path.join(os.path.dirname(os.path.abspath(__file__)),'admin-static')
+PAGES={
+ '/':'index.html','/index.html':'index.html',
+ '/publish':'publish.html','/publish.html':'publish.html',
+ '/app.js':'app.js','/publish.js':'publish.js','/admin.css':'admin.css',
+ '/styles.css':None,
+}
 
 
 class AdminHandler(Handler):
@@ -27,16 +34,32 @@ class AdminHandler(Handler):
             self._send(403,{'ok':False,'error':'缺少管理请求保护头'});return False
         return True
 
+    def _release(self):
+        # The publish log is Python 3.11 only. Python 3.6 keeps the existing admin pages.
+        if sys.version_info < (3, 11):
+            self._send(503,{'ok':False,'error':'发布记录需要用 Python 3.11 启动本机管理进程。当前进程未启用该模块，未创建发布记录。'})
+            return
+        try:
+            from release_console.httpapi import handle
+        except (ImportError, SyntaxError):
+            self._send(503,{'ok':False,'error':'发布记录模块无法加载，未创建发布记录。'})
+            return
+        handle(self)
+
     def do_GET(self):
         if not self._allowed():return
         path=urlsplit(self.path).path
         if path=='/api/tasks':self._send(200,{'ok':True,'data':core.tasks()});return
         if path=='/api/events':self._send(200,{'ok':True,'data':core.events()});return
-        file={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/admin.css':'admin.css','/styles.css':None}.get(path,'')
+        if path=='/api/releases' or path.startswith('/api/releases/'):
+            self._release();return
+        file=PAGES.get(path,'')
         if file is None:
             target=os.path.join(os.path.dirname(STATIC),'static','styles.css')
         elif file:target=os.path.join(STATIC,file)
         else:self._send(404,{'ok':False,'error':'接口不存在'});return
+        if not os.path.isfile(target):
+            self._send(404,{'ok':False,'error':'资源不存在'});return
         with open(target,'rb') as f:data=f.read()
         ctype='text/css; charset=utf-8' if path.endswith('.css') else 'application/javascript; charset=utf-8' if path.endswith('.js') else 'text/html; charset=utf-8'
         self._send(200,data,ctype)
@@ -44,6 +67,8 @@ class AdminHandler(Handler):
     def do_POST(self):
         if not self._allowed(True):return
         path=urlsplit(self.path).path
+        if path=='/api/releases' or path.startswith('/api/releases/'):
+            self._release();return
         match=re.match(r'^/api/tasks(?:/(custom-[a-f0-9]{12}|home|resume|ops-hub|ai-test|games|qa-health|jenkins-login))?$',path)
         if not match:self._send(404,{'ok':False,'error':'接口不存在'});return
         try:
