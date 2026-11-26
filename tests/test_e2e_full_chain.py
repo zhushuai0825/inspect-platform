@@ -61,6 +61,11 @@ class TestFullChainE2E(unittest.TestCase):
         self.dispatcher_env['RELEASE_ROOT'] = str(self.release_root)
         self.dispatcher_env['RELEASE_STATE'] = str(self.release_state)
         
+        # Preflight runner路径（使用fake runner）
+        fake_runner = Path(__file__).parent / 'fixtures' / 'fake-runner-success'
+        if fake_runner.exists():
+            self.dispatcher_env['RELEASE_TEST_RUNNER_PATH'] = str(fake_runner)
+        
         # Release 环境变量
         self.release_env = os.environ.copy()
         self.release_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(
@@ -494,6 +499,10 @@ class TestFullChainE2E(unittest.TestCase):
         2. 旧版本不变
         3. 服务保持运行
         """
+        # 使用失败的runner（覆盖setUp中的success runner）
+        fake_runner_fail = Path(__file__).parent / 'fixtures' / 'fake-runner-fail'
+        self.dispatcher_env['RELEASE_TEST_RUNNER_PATH'] = str(fake_runner_fail)
+        
         # 1. 创建 Git repo 并获取 commit
         commit_sha = self.create_git_bare_with_code()
         
@@ -588,10 +597,15 @@ class T(unittest.TestCase):
         # 5. 运行 dispatcher
         result = self.run_dispatcher_once(timeout=60)
         
-        # 6. 验证部署失败（preflight 阻止）
-        # Dispatcher 应该非零退出（部署失败）
+        # 6. 精确断言产品错误码。MISSING_REQUIRED_SOURCE 或其他失败不能让本用例变绿。
+        output = result.stdout + result.stderr
         self.assertNotEqual(result.returncode, 0,
-            'Dispatcher should fail when preflight fails')
+            'Dispatcher should fail when preflight fails: {}'.format(output))
+        self.assertIn('"code": "PREFLIGHT_RUNNER_FAILED"', output,
+            'Should fail with PREFLIGHT_RUNNER_FAILED, not another error: {}'.format(output))
+        self.assertNotIn('MISSING_REQUIRED_SOURCE', output)
+        self.assertNotIn('ROOT_SSH_ONLY', output)
+        self.assertNotIn('RELEASE_HELPER_REJECTED', output)
         
         # 7. 验证旧版本不变
         current = json.loads((self.release_state / 'current.json').read_text())

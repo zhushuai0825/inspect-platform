@@ -1,0 +1,12 @@
+#!/bin/bash
+# 测试夹具：模拟失败的runner
+# 用于测试preflight fail-closed
+
+CANDIDATE_SRC="${1:?Missing candidate source}"
+
+# 模拟runner执行测试失败
+echo "Runner: Executing tests for $CANDIDATE_SRC"
+echo "Runner: Test failed: test_something FAILED" >&2
+
+# 返回失败
+exit 1

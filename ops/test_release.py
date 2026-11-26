@@ -33,6 +33,11 @@ class ReleaseTests(unittest.TestCase):
             p=self.root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(self.content(name,'old'))
         d=self.root/'data';d.mkdir();(d/'mail.env').write_text('PRIVATE_FIXTURE');(d/'mail.env').chmod(0o600);(d/'secret.env').write_text('PRIVATE_OTHER_FIXTURE');(d/'platform.db').write_bytes(b'DATABASE_FIXTURE')
         (d/'reports').mkdir();(d/'reports'/'keep.json').write_text('{"fixture":true}')
+        
+        # 设置测试runner（使用fake-runner-success）
+        runner_path = Path(__file__).parent.parent / 'tests' / 'fixtures' / 'fake-runner-success'
+        os.environ['RELEASE_TEST_RUNNER_PATH'] = str(runner_path)
+        
         self.controller=LocalController(self.root);self.m=r.Manager(self.root,self.base/'state',self.controller);self.m.baseline('baseline')
     def tearDown(self):self.controller.close();self.tmp.cleanup()
     def content(self,name,version):
@@ -59,8 +64,16 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(r.ReleaseError,'DEPLOY_FAILED_ROLLED_BACK'):self.m.deploy('unhealthy')
         self.assertIn("'old'",(self.root/'app.py').read_text());self.controller.health();self.assertEqual(self.m.status()['transaction']['phase'],'rolled_back');self.assert_data()
     def test_preflight_failure_never_stops_services(self):
-        with self.assertRaisesRegex(r.ReleaseError,'PREFLIGHT_TEST_FAILED'):self.m.prepare(self.archive(bad_tests=True),'bad')
-        self.assertEqual(self.controller.calls,[]);self.assert_data()
+        # 使用失败的runner测试preflight失败场景
+        runner_fail = Path(__file__).parent.parent / 'tests' / 'fixtures' / 'fake-runner-fail'
+        old_runner = os.environ.get('RELEASE_TEST_RUNNER_PATH')
+        os.environ['RELEASE_TEST_RUNNER_PATH'] = str(runner_fail)
+        try:
+            with self.assertRaisesRegex(r.ReleaseError,'PREFLIGHT_RUNNER_FAILED'):self.m.prepare(self.archive(bad_tests=True),'bad')
+            self.assertEqual(self.controller.calls,[]);self.assert_data()
+        finally:
+            if old_runner:
+                os.environ['RELEASE_TEST_RUNNER_PATH'] = old_runner
     def test_checksum_tampering_rejected_before_stop(self):
         self.prepared();(self.m.path('new')/'source/app.py').write_text('VALUE=0')
         with self.assertRaisesRegex(r.ReleaseError,'CHECKSUM_MISMATCH'):self.m.deploy('new')

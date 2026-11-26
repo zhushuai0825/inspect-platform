@@ -23,20 +23,35 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 # Python 3.6 兼容：不使用 capture_output
 PYTHON36_COMPAT = sys.version_info < (3, 7)
 
-# 配置（由 root 拥有的配置文件加载）
-CONFIG_FILE = Path('/opt/inspect-deploy/config.json')
+# 配置（控制面，root:inspect-deploy 0640；不放 secret/mail/sqlite）
+# 应用树是 /opt/inspect-platform，不是 /source，也不是控制面目录。
+CONFIG_FILE = Path('/opt/inspect-deploy/config/deploy-config.json')
 DEFAULT_CONFIG = {
     'repo_url': 'https://github.com/zhushuai0825/inspect-platform.git',
     'branch': 'main',
-    'spool_dir': '/opt/inspect-platform/data/deploy-spool',
-    'work_dir': '/opt/inspect-deploy/work',
-    'log_file': '/opt/inspect-deploy/dispatcher.log'
+    'spool_dir': '/var/lib/inspect-deploy/spool',
+    'work_dir': '/var/lib/inspect-deploy/work',
+    'log_file': '/var/lib/inspect-deploy/log/dispatcher.log'
 }
+
+# 控制面固定入口。root 调用 release.py；非 root 生产进程只允许 sudo 这个 helper。
+FIXED_RELEASE_PY = '/opt/inspect-deploy/bin/release.py'
+FIXED_RELEASE_HELPER = '/opt/inspect-deploy/bin/inspect-release'
+APP_DATA_DIR = '/opt/inspect-platform/data'
+
+
+def assert_spool_outside_app_data(spool):
+    """部署队列必须在控制面下，不能放进应用 data。本函数不创建目录。"""
+    text = os.path.realpath(str(spool))
+    data = os.path.realpath(APP_DATA_DIR)
+    if text == data or text.startswith(data + os.sep):
+        raise ValueError('spool must not be under application data {}: {}'.format(data, text))
 
 def load_config():
     """
@@ -85,7 +100,7 @@ def load_config():
 CONFIG = load_config()
 SPOOL = Path(CONFIG['spool_dir'])
 WORK_DIR = Path(CONFIG['work_dir'])
-LOG_FILE = Path(CONFIG.get('log_file', '/tmp/dispatcher.log'))
+LOG_FILE = Path(CONFIG.get('log_file', '/var/lib/inspect-deploy/log/dispatcher.log'))
 
 def log(msg):
     """写日志（Python 3.6 兼容）"""
@@ -309,16 +324,54 @@ def fetch_source(repo_url, commit, work_dir):
             shutil.rmtree(str(clone_dir))
         raise
 
+def assert_packable_source(source_dir, file_path):
+    """
+    白名单成员必须是源码目录内的普通文件。
+
+    拒绝软链（含中间目录软链）和解析后落到源码目录外的路径。
+    硬链接可以在不经过路径检查的情况下把目录外 inode 带进包，同样拒绝。
+    """
+    source_dir = Path(source_dir)
+    relative = Path(file_path)
+    if relative.is_absolute() or '..' in relative.parts:
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise Exception('源码软链不允许: {}'.format(file_path))
+    src_file = source_dir / relative
+    if not src_file.is_file():
+        raise Exception('源码路径非普通文件: {}'.format(file_path))
+    source_resolved = source_dir.resolve()
+    src_resolved = src_file.resolve()
+    try:
+        src_resolved.relative_to(source_resolved)
+    except ValueError:
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    if src_resolved != src_file.absolute():
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    stat_info = src_file.lstat()
+    if stat_info.st_nlink > 1:
+        raise Exception('源码硬链接不允许: {}'.format(file_path))
+    return src_file
+
 def create_artifact(source_dir, commit):
     """
-    创建部署制品
+    创建部署制品（白名单过滤）
     
     安全：
-    - 使用 git archive（不包含 .git）
+    - 只打包白名单文件（与ops/release.py一致）
+    - 排除控制面（deploy-scripts/, control-plane/）
+    - 排除secrets, .git
     - 计算 SHA256
-    - 保存在封闭目录
     """
     log('创建制品: {}'.format(commit[:8]))
+    
+    # 白名单（与 ops/release.py RUNTIME|OPS 完全一致）
+    RUNTIME = set(""".gitignore DEPLOYMENT.md MAIL-ACTIVATION.md MAIL-SETUP.md README.md admin-static/admin.css admin-static/app.js admin-static/index.html admin.py app.py core.py deploy/inspect-admin.service deploy/inspect-mail.service deploy/inspect-platform.service deploy/inspect-worker.service deploy/update_job.py inspect_run.sh jenkins/Jenkinsfile notifications.py static/app.js static/index.html static/styles.css tests/test_notifications.py tests/test_platform.py worker.py""".split())
+    OPS = {'ops/release.py', 'ops/test_release.py', 'ops/RELEASE.md'}
+    WHITELIST = RUNTIME | OPS
     
     # 制品目录
     artifacts_dir = safe_path_join(WORK_DIR, 'artifacts')
@@ -327,25 +380,36 @@ def create_artifact(source_dir, commit):
     artifact_name = 'inspect-platform-{}.zip'.format(commit[:8])
     artifact_path = safe_path_join(artifacts_dir, artifact_name)
     
-    # 使用 git archive
-    cmd = [
-        'git', 'archive',
-        '--format=zip',
-        '--prefix=inspect-platform/',
-        'HEAD',
-        '--output', str(artifact_path)
-    ]
+    # 创建zip（只包含白名单文件）
+    log('打包白名单: {} 个文件'.format(len(WHITELIST)))
+    packed_count = 0
+    missing_count = 0
     
-    returncode, stdout, stderr = run_command(cmd, cwd=str(source_dir), timeout=60)
-    
-    if returncode != 0:
-        raise Exception('git archive 失败: {}'.format(stderr))
+    with zipfile.ZipFile(str(artifact_path), 'w', zipfile.ZIP_DEFLATED) as z:
+        for file_path in sorted(WHITELIST):
+            src_file = source_dir / file_path
+            # exists() 会跟随软链。悬空软链不能当成“文件缺失”跳过。
+            current = source_dir
+            for part in Path(file_path).parts:
+                current = current / part
+                if current.is_symlink():
+                    raise Exception('源码软链不允许: {}'.format(file_path))
+
+            # 缺失文件跳过；存在的成员必须是源码目录内的普通文件
+            if not src_file.exists():
+                missing_count += 1
+                log('警告: 白名单文件缺失: {}'.format(file_path))
+                continue
+            assert_packable_source(source_dir, file_path)
+            z.write(str(src_file), 'inspect-platform/' + file_path)
+            packed_count += 1
     
     if not artifact_path.exists():
         raise Exception('制品未创建')
     
+    log('✓ 已打包: {} 个文件 ({} 个缺失)'.format(packed_count, missing_count))
+    
     # 计算 SHA256
-    log('计算 SHA256...')
     sha256 = hashlib.sha256()
     with open(str(artifact_path), 'rb') as f:
         while True:
@@ -360,55 +424,190 @@ def create_artifact(source_dir, commit):
     with open(str(hash_file), 'w') as f:
         f.write('{}  {}\n'.format(hash_value, artifact_name))
     
-    log('✓ 制品已创建: {} ({} bytes)'.format(
-        artifact_name, artifact_path.stat().st_size
-    ))
+    log('✓ 制品: {} ({} bytes)'.format(artifact_name, artifact_path.stat().st_size))
     
     return artifact_path, hash_file
 
+def verify_trusted_path(path_str, description='path', check_ancestors=True):
+    """
+    验证可信路径安全性
+    
+    检查：
+    1. 文件存在且不是符号链接
+    2. 文件owner为root（root模式）
+    3. 文件不可组写/他人写（mode & 0o022 == 0）
+    4. 完整祖先链（到根或受保护锚点）：
+       - 每个祖先不是符号链接
+       - 每个祖先owner为root（root模式）
+       - 每个祖先不可组写/他人写
+    
+    非root测试模式：
+    - 跳过owner检查
+    - 保留权限检查
+    - 允许受保护锚点内的路径（如测试临时目录）
+    """
+    path = Path(path_str).resolve()
+    is_root_mode = os.geteuid() == 0
+    
+    if not path.exists():
+        raise Exception('{} does not exist: {}'.format(description, path_str))
+    
+    # 检查文件本身不是符号链接（在resolve前的原始路径）
+    orig_path = Path(path_str)
+    if orig_path.is_symlink():
+        raise Exception('{} is a symlink (not allowed): {}'.format(description, path_str))
+    
+    # 检查路径规范化（防止 ../ 等路径穿越）
+    if str(path) != str(orig_path.absolute()):
+        raise Exception('{} contains path traversal: {} -> {}'.format(
+            description, path_str, path))
+    
+    # 验证文件本身
+    stat_info = path.stat()
+    
+    if is_root_mode and stat_info.st_uid != 0:
+        raise Exception('{} not owned by root: uid={}'.format(
+            description, stat_info.st_uid))
+    
+    if stat_info.st_mode & 0o022:
+        raise Exception('{} is group/world-writable: mode={:o}'.format(
+            description, stat_info.st_mode))
+    
+    # 验证完整祖先链
+    if check_ancestors:
+        current = path.parent
+        ancestors_checked = 0
+        
+        # 受保护锚点：停止祖先检查的边界
+        # Root模式：检查到根目录
+        # 非root测试：检查到测试目录顶层（不检查/tmp等系统目录）
+        protected_anchors = []
+        if not is_root_mode:
+            # 非root测试：识别测试目录顶层作为受保护锚点
+            # 检查路径是否在/tmp下的测试目录中
+            path_str = str(path)
+            if path_str.startswith('/tmp/'):
+                # 找到/tmp下的第一级目录（如 /tmp/test_dispatcher_xxx）
+                parts = path_str.split('/')
+                if len(parts) >= 3:  # ['', 'tmp', 'test_xxx', ...]
+                    protected_anchors.append(Path('/' + parts[1] + '/' + parts[2]))
+        
+        while current != current.parent:  # 未到根目录
+            ancestors_checked += 1
+            if ancestors_checked > 100:  # 防止无限循环
+                raise Exception('{} ancestor chain too deep'.format(description))
+            
+            # 检查到受保护锚点则停止（不检查锚点本身）
+            if current in protected_anchors:
+                break
+            
+            # 检查祖先不是符号链接
+            if current.is_symlink():
+                raise Exception('{} ancestor is symlink: {}'.format(description, current))
+            
+            # 检查祖先stat
+            ancestor_stat = current.stat()
+            
+            # Root模式：检查祖先owner
+            if is_root_mode and ancestor_stat.st_uid != 0:
+                raise Exception('{} ancestor not root-owned: {} (uid={})'.format(
+                    description, current, ancestor_stat.st_uid))
+            
+            # 检查祖先权限（所有模式）
+            if ancestor_stat.st_mode & 0o022:
+                raise Exception('{} ancestor group/world-writable: {} (mode={:o})'.format(
+                    description, current, ancestor_stat.st_mode))
+            
+            current = current.parent
+    
+    return True
+
+def resolve_release_invocation():
+    """
+    决定 release 入口。只看调用时的 euid，不看 CONFIG 里有没有 RELEASE_ROOT。
+
+    euid==0：始终是 /usr/bin/python3 /opt/inspect-deploy/bin/release.py。
+    CONFIG、RELEASE_CLI、RELEASE_ROOT、RELEASE_TEST_* 都不改变路径，也不 sudo。
+
+    euid!=0 且环境里有非空 RELEASE_CLI：测试注入，直接执行该路径，不 sudo。
+    euid!=0 且没有 RELEASE_CLI：生产路径，sudo 固定 helper。
+    helper 再执行固定 release.py。sudoers 不得指向可写源码树。
+    """
+    if os.geteuid() == 0:
+        return {
+            'release_py': FIXED_RELEASE_PY,
+            'use_sudo': False,
+            'is_test_sandbox': False,
+            'command_prefix': ['/usr/bin/python3', FIXED_RELEASE_PY],
+        }
+    release_cli = os.environ.get('RELEASE_CLI') or ''
+    if release_cli:
+        return {
+            'release_py': release_cli,
+            'use_sudo': False,
+            'is_test_sandbox': True,
+            'command_prefix': [sys.executable, release_cli],
+        }
+    return {
+        'release_py': FIXED_RELEASE_PY,
+        'use_sudo': True,
+        'is_test_sandbox': False,
+        'command_prefix': ['sudo', '-n', '--', FIXED_RELEASE_HELPER],
+    }
+
+def release_child_env(is_test_sandbox):
+    """生产子进程不继承测试覆盖。测试沙盒才传递 RELEASE_TEST_SANDBOX。"""
+    cmd_env = os.environ.copy()
+    if not is_test_sandbox:
+        for key in list(cmd_env):
+            if key == 'RELEASE_CLI' or key == 'RELEASE_ROOT' or key == 'RELEASE_STATE' or key.startswith('RELEASE_TEST_'):
+                del cmd_env[key]
+        return cmd_env
+    release_root = CONFIG.get('release_root')
+    release_state = CONFIG.get('release_state')
+    if release_root and release_state:
+        cmd_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(release_root, release_state)
+    cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
+    cmd_env.pop('RELEASE_TEST_SKIP_PREFLIGHT', None)
+    return cmd_env
+
 def execute_deploy(artifact_path, commit):
     """
-    执行部署
-    
-    安全：
-    - 调用固定的 release.py（root 拥有）
-    - 不执行 repo 中的代码
+    执行部署。
+
+    路径由 resolve_release_invocation() 决定。root 不能因 CONFIG 或环境变量改走测试入口。
     """
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
-    
-    # 固定的 release.py 路径（测试环境可覆盖）
-    release_py = CONFIG.get('release_cli', '/opt/inspect-platform/ops/release.py')
-    
-    if not Path(release_py).exists():
-        raise Exception('release.py 不存在: {}'.format(release_py))
-    
-    # 构建命令（测试环境不使用 sudo）
-    is_test_env = 'RELEASE_CLI' in os.environ or 'RELEASE_ROOT' in CONFIG
-    python_cmd = sys.executable if is_test_env else '/usr/bin/python3'
-    use_sudo = not is_test_env
-    
-    # 测试环境变量
-    cmd_env = os.environ.copy()
-    if 'release_root' in CONFIG:
-        cmd_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(
-            CONFIG['release_root'],
-            CONFIG['release_state']
-        )
-        # 不跳过 preflight：实际执行候选测试
-        # cmd_env['RELEASE_TEST_SKIP_PREFLIGHT'] = '1'  # 已移除
-        cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
-    
-    # Prepare
-    log('执行: prepare (env={})'.format('test' if is_test_env else 'prod'))
-    if is_test_env:
-        log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
-    cmd = []
+
+    decision = resolve_release_invocation()
+    is_test_sandbox = decision['is_test_sandbox']
+    use_sudo = decision['use_sudo']
+    release_py = decision['release_py']
+
+    if os.geteuid() == 0 and (is_test_sandbox or use_sudo or release_py != FIXED_RELEASE_PY):
+        raise Exception('root release invocation drifted from the fixed control-plane path')
+
     if use_sudo:
-        cmd.extend(['sudo', python_cmd])
+        verify_trusted_path(FIXED_RELEASE_HELPER, 'Control plane helper')
+        verify_trusted_path(FIXED_RELEASE_PY, 'Control plane release.py')
+        log('生产模式: sudo {} -> {}'.format(FIXED_RELEASE_HELPER, FIXED_RELEASE_PY))
+    elif is_test_sandbox:
+        verify_trusted_path(release_py, 'Test RELEASE_CLI')
+        log('测试沙盒模式: RELEASE_CLI={}'.format(release_py))
     else:
-        cmd.append(python_cmd)
-    cmd.extend([release_py, 'prepare', str(artifact_path), version])
+        verify_trusted_path(FIXED_RELEASE_PY, 'Control plane release.py')
+        log('root 生产模式: {}'.format(FIXED_RELEASE_PY))
+
+    log('release 入口安全验证通过: {}'.format(release_py))
+    cmd_env = release_child_env(is_test_sandbox)
+
+    # Prepare
+    log('执行: prepare (env={})'.format('test' if is_test_sandbox else 'prod'))
+    if is_test_sandbox:
+        log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
+    cmd = list(decision['command_prefix'])
+    cmd.extend(['prepare', str(artifact_path), version])
     
     # Python 3.6 兼容
     proc = subprocess.Popen(
@@ -421,19 +620,16 @@ def execute_deploy(artifact_path, commit):
     stdout, stderr = proc.communicate(timeout=300)
     
     if proc.returncode != 0:
-        log('prepare 失败: stdout={} stderr={}'.format(stdout, stderr))
-        raise Exception('prepare 失败: {}'.format(stderr))
+        detail = 'stdout={} stderr={}'.format(stdout, stderr)
+        log('prepare 失败: {}'.format(detail))
+        raise Exception('prepare 失败: {}'.format(detail))
     
     log('prepare 成功: {}'.format(stdout[:200]))
     
     # Deploy
-    log('执行: deploy (env={})'.format('test' if is_test_env else 'prod'))
-    cmd = []
-    if use_sudo:
-        cmd.extend(['sudo', python_cmd])
-    else:
-        cmd.append(python_cmd)
-    cmd.extend([release_py, 'deploy', version])
+    log('执行: deploy (env={})'.format('test' if is_test_sandbox else 'prod'))
+    cmd = list(decision['command_prefix'])
+    cmd.extend(['deploy', version])
     
     proc = subprocess.Popen(
         cmd,
@@ -445,8 +641,9 @@ def execute_deploy(artifact_path, commit):
     stdout, stderr = proc.communicate(timeout=600)
     
     if proc.returncode != 0:
-        log('deploy 失败: stdout={} stderr={}'.format(stdout, stderr))
-        raise Exception('deploy 失败: {}'.format(stderr))
+        detail = 'stdout={} stderr={}'.format(stdout, stderr)
+        log('deploy 失败: {}'.format(detail))
+        raise Exception('deploy 失败: {}'.format(detail))
     
     log('deploy 成功: {}'.format(stdout[:200]))
     
@@ -673,16 +870,16 @@ def main():
     log('  Work: {}'.format(WORK_DIR))
     log('=' * 60)
     
-    # 确保目录存在
-    SPOOL.mkdir(parents=True, exist_ok=True, mode=0o755)
-    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    
-    # 安全检查：spool 及父目录无符号链接
+    # 先拒绝应用 data 下的 spool 和符号链接，再创建目录。
     try:
+        assert_spool_outside_app_data(SPOOL)
         check_no_symlinks(SPOOL)
     except ValueError as e:
         log('致命错误: {}'.format(e))
         sys.exit(1)
+
+    SPOOL.mkdir(parents=True, exist_ok=True, mode=0o750)
+    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     
     while True:
         try:

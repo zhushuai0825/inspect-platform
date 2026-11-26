@@ -45,72 +45,53 @@
 
 ## 2. 安装步骤（测试环境）
 
-### 2.1 创建目录结构
+### 2.1 只运行官方脚本
+
+目录由 `control-plane/INSTALL-CONTROL-PLANE.sh` 创建。不要另用 `install -d` 覆盖已经存在的生产目录。
 
 ```bash
-# 以 root 身份操作
-sudo mkdir -p /opt/inspect-deploy/{work,logs}
-sudo mkdir -p /opt/inspect-platform/data/deploy-spool
-sudo mkdir -p /opt/inspect-ops/scripts
-
-# 设置权限
-sudo chmod 700 /opt/inspect-deploy
-sudo chmod 755 /opt/inspect-platform/data/deploy-spool
+sudo bash control-plane/INSTALL-CONTROL-PLANE.sh
 ```
 
-### 2.2 安装 Dispatcher
+不带 `INSTALL_ROOT` 时，脚本会创建 `inspect-deploy` 组和 `inspect-dispatcher` 用户。带 `INSTALL_ROOT` 的前缀安装只写该前缀下的副本，不调用 `useradd` / `groupadd`。`INSTALL_ROOT` 不能落在 `/opt`、`/var`、`/var/lib`、`/etc` 这类父路径上，也不能落在 `/opt/inspect-platform`、`/opt/inspect-ops`、`/opt/inspect-deploy`、`/var/lib/inspect-deploy` 或 `/etc/sudoers.d` 里面。
 
-```bash
-# 复制主程序
-sudo cp dispatcher.py /opt/inspect-deploy/
-sudo chmod 755 /opt/inspect-deploy/dispatcher.py
-sudo chown root:root /opt/inspect-deploy/dispatcher.py
+脚本会安装这些控制面路径：
 
-# 创建配置
-sudo cp config.json.example /opt/inspect-deploy/config.json
-sudo chmod 600 /opt/inspect-deploy/config.json
-sudo chown root:root /opt/inspect-deploy/config.json
+- `/opt/inspect-deploy`（程序、配置、unit 副本、runner 定义）
+- `/var/lib/inspect-deploy`（work、backups、runner-stage）
+- `/var/lib/inspect-deploy/spool`（请求队列，属主 inspect-dispatcher）
+- `/etc/sudoers.d/inspect-deploy`（只允许固定 helper；visudo 失败则删除）
 
-# 编辑配置（如需要）
-sudo vi /opt/inspect-deploy/config.json
-```
+脚本对已经存在的生产目录只做检查，不 `chown`、不 `chmod`、不 `install -d`：
 
-**配置说明**：
+| 路径 | 可以继续安装的前提 | 否则 |
+| --- | --- | --- |
+| `/opt/inspect-platform` | 真实目录，且不是世界可写。属主可以不是 root | 失败退出，目录保持原样 |
+| `/opt/inspect-platform/data` | 真实目录，且不是世界可写。不要求改成 0711 | 失败退出，目录保持原样 |
+| `/opt/inspect-ops` | 若存在，必须是 root:root 且 mode 0700 | 失败退出，不放宽、不收紧 |
+| `/opt/inspect-ops/state` | 若存在，必须是 root:root 且 mode 0700 | 失败退出，不改权限 |
+
+不存在的应用目录不会被创建。`/opt/inspect-platform/data/deploy-spool` 不会被创建；如果它已经存在，脚本失败退出，并且不删除、不改它。`/opt/inspect-ops` 若不存在，脚本不创建它。只有在 `/opt/inspect-ops` 已经是 root:root 0700 且 `state` 还不存在时，脚本才用 `mkdir` 创建 `state` 这一个目录，不用 `install -d` 改父目录。
+
+脚本不读取 `secret.env`、`mail.env` 或数据库。
+
+### 2.2 配置
+
+脚本安装 `control-plane/config/deploy-config.json` 为 `/opt/inspect-deploy/config/deploy-config.json`，root:inspect-deploy 0640。不要改成 0600，也不要改成 0644。
+
 - `repo_url`: 固定 GitHub repo（不可由请求更改）
 - `branch`: 固定 main（不可由请求更改）
-- `spool_dir`: 请求队列目录
-- `work_dir`: 工作目录（克隆/制品）
+- `spool_dir`: `/var/lib/inspect-deploy/spool`
+- `work_dir`: `/var/lib/inspect-deploy/work`
+- `log_file`: `/var/lib/inspect-deploy/log/dispatcher.log`
 
-### 2.3 安装 Systemd Service
+### 2.3 不在本安装里做的事
 
-```bash
-# 复制 service 文件
-sudo cp inspect-deploy-dispatcher.service /etc/systemd/system/
-sudo chmod 644 /etc/systemd/system/inspect-deploy-dispatcher.service
+下面这些都不是本安装脚本的步骤，也还没有验收。不要把它们当成必做：
 
-# 重载 systemd
-sudo systemctl daemon-reload
-
-# 启用（但不立即启动）
-sudo systemctl enable inspect-deploy-dispatcher
-```
-
-### 2.4 安装 Jenkins 脚本
-
-```bash
-# Jenkins 容器内
-sudo cp notify-deploy.sh /var/jenkins_home/jenkins-scripts/
-sudo chmod 755 /var/jenkins_home/jenkins-scripts/notify-deploy.sh
-```
-
-### 2.5 安装隔离测试脚本
-
-```bash
-# 复制到运维脚本目录
-sudo cp run-candidate-tests.sh /opt/inspect-ops/scripts/
-sudo chmod 755 /opt/inspect-ops/scripts/run-candidate-tests.sh
-sudo chown root:root /opt/inspect-ops/scripts/run-candidate-tests.sh
-```
+- 不把 unit 拷到 `/etc/systemd`，不 `systemctl daemon-reload`，不 `systemctl enable`，不 `systemctl start`
+- 不把 `notify-deploy.sh` 拷进 Jenkins 家目录
+- 不把脚本拷进 `/opt/inspect-ops/scripts/`
 
 ---
 
@@ -146,7 +127,7 @@ python3 tests/test_e2e_local.py
 # 验证配置文件
 sudo python3 -c "
 import json
-with open('/opt/inspect-deploy/config.json') as f:
+with open('/opt/inspect-deploy/config/deploy-config.json') as f:
     config = json.load(f)
 print('Repo:', config['repo_url'])
 print('Branch:', config['branch'])
@@ -180,7 +161,7 @@ cat > /tmp/test-spool/request-manual-test.json <<EOF
 EOF
 
 # 手动运行 dispatcher（一次）
-# 注意：需要修改 config.json 指向 /tmp/test-spool
+# 注意：需要修改 deploy-config.json 指向 /tmp/test-spool
 # 或环境变量覆盖
 ```
 
@@ -188,34 +169,9 @@ EOF
 
 ## 4. 启动与监控
 
-### 4.1 启动 Dispatcher
+`systemctl enable` 和 `systemctl start` 不是安装步骤，本轮没有验收，不要从本文档执行。安装脚本只把 unit 放在 `/opt/inspect-deploy/systemd/`。
 
-```bash
-# 启动服务
-sudo systemctl start inspect-deploy-dispatcher
-
-# 检查状态
-sudo systemctl status inspect-deploy-dispatcher
-
-# 查看日志
-sudo journalctl -u inspect-deploy-dispatcher -f
-```
-
-### 4.2 停止 Dispatcher
-
-```bash
-sudo systemctl stop inspect-deploy-dispatcher
-```
-
-### 4.3 查看日志
-
-```bash
-# Systemd journal
-sudo journalctl -u inspect-deploy-dispatcher --since "1 hour ago"
-
-# Dispatcher 日志文件
-sudo tail -f /opt/inspect-deploy/dispatcher.log
-```
+日志文件配置为 `/var/lib/inspect-deploy/log/dispatcher.log`。该目录属主是 `inspect-dispatcher`，父目录 `/var/lib/inspect-deploy` 仍是 root 所有且组不可写。本文档不要求在生产机上跟踪 journal。
 
 ---
 
@@ -225,7 +181,7 @@ sudo tail -f /opt/inspect-deploy/dispatcher.log
 
 ```bash
 # 备份配置
-sudo cp /opt/inspect-deploy/config.json /opt/inspect-deploy/config.json.backup-$(date +%Y%m%d-%H%M%S)
+sudo cp /opt/inspect-deploy/config/deploy-config.json /opt/inspect-deploy/config/deploy-config.json.backup-$(date +%Y%m%d-%H%M%S)
 
 # 备份程序
 sudo cp /opt/inspect-deploy/dispatcher.py /opt/inspect-deploy/dispatcher.py.backup-$(date +%Y%m%d-%H%M%S)
@@ -233,21 +189,7 @@ sudo cp /opt/inspect-deploy/dispatcher.py /opt/inspect-deploy/dispatcher.py.back
 
 ### 5.2 撤销安装
 
-```bash
-# 停止服务
-sudo systemctl stop inspect-deploy-dispatcher
-sudo systemctl disable inspect-deploy-dispatcher
-
-# 删除 service
-sudo rm /etc/systemd/system/inspect-deploy-dispatcher.service
-sudo systemctl daemon-reload
-
-# 删除程序（可选）
-sudo rm -rf /opt/inspect-deploy
-
-# 保留 spool（如需要）
-# sudo rm -rf /opt/inspect-platform/data/deploy-spool
-```
+撤销没有随本安装脚本验收。不要为了撤销去改 `/opt/inspect-platform` 或删除应用 data 里的文件。队列若已按本脚本创建，位置是 `/var/lib/inspect-deploy/spool`，不是 `/opt/inspect-platform/data/deploy-spool`。
 
 ---
 
@@ -256,17 +198,17 @@ sudo rm -rf /opt/inspect-deploy
 ### 6.1 文件权限
 
 ```bash
-# Dispatcher 程序
-sudo ls -l /opt/inspect-deploy/dispatcher.py
+# Dispatcher 程序（控制面，root 拥有，目录不可被 dispatcher 用户写入）
+sudo ls -l /opt/inspect-deploy/bin/dispatcher.py /opt/inspect-deploy/bin/inspect-release
 # 应为：-rwxr-xr-x root root
 
-# 配置文件
-sudo ls -l /opt/inspect-deploy/config.json
-# 应为：-rw------- root root
+# 配置文件（组 inspect-deploy 可读，与 service 的 Group= 一致）
+sudo ls -l /opt/inspect-deploy/config/deploy-config.json
+# 应为：-rw-r----- root inspect-deploy
 
-# 工作目录
-sudo ls -ld /opt/inspect-deploy/work
-# 应为：drwx------ root root
+# 工作目录在控制面外面
+sudo ls -ld /var/lib/inspect-deploy/work
+# 应为：drwxr-x--- inspect-dispatcher inspect-deploy
 ```
 
 ### 6.2 配置检查
@@ -275,17 +217,18 @@ sudo ls -ld /opt/inspect-deploy/work
 # repo_url 是否为固定 GitHub URL
 # branch 是否为 main
 # spool_dir 是否正确
-# work_dir 是否在 /opt/inspect-deploy 下
+# work_dir 是否为 /var/lib/inspect-deploy/work
+# spool_dir 是否为 /var/lib/inspect-deploy/spool，而不是应用 data
 ```
 
 ### 6.3 符号链接检查
 
 ```bash
-# spool 及父目录无符号链接
-sudo find /opt/inspect-platform/data/deploy-spool -type l
+# spool 在控制面，不在应用 data
+sudo find /var/lib/inspect-deploy/spool -type l
 
 # work 目录无符号链接
-sudo find /opt/inspect-deploy/work -type l
+sudo find /var/lib/inspect-deploy/work -type l
 ```
 
 ---
@@ -302,14 +245,14 @@ sudo journalctl -u inspect-deploy-dispatcher -n 50
 python3 --version
 
 # 检查配置文件
-sudo python3 -c "import json; print(json.load(open('/opt/inspect-deploy/config.json')))"
+sudo python3 -c "import json; print(json.load(open('/opt/inspect-deploy/config/deploy-config.json')))"
 ```
 
 ### 7.2 请求未处理
 
 ```bash
-# 检查 spool 目录
-sudo ls -la /opt/inspect-platform/data/deploy-spool/
+# 检查 spool 目录（控制面，不是应用 data）
+sudo ls -la /var/lib/inspect-deploy/spool/
 
 # 检查 dispatcher 是否运行
 sudo systemctl is-active inspect-deploy-dispatcher
@@ -360,7 +303,7 @@ SOURCE=/tmp/test-source
 DATA=/tmp/test-data
 mkdir -p $SOURCE $DATA
 echo '# test' > $SOURCE/app.py
-bash /opt/inspect-ops/scripts/run-candidate-tests.sh $SOURCE $DATA
+bash control-plane/bin/run-candidate-tests $SOURCE $DATA
 ```
 
 ### 8.3 release.py 集成
@@ -383,6 +326,5 @@ bash /opt/inspect-ops/scripts/run-candidate-tests.sh $SOURCE $DATA
 
 ---
 
-**文档版本**: 2026-11-25  
-**状态**: 测试环境验收  
-**下一里程碑**: 生产环境验收
+**文档版本**: 2026-11-26  
+**状态**: 与 INSTALL-CONTROL-PLANE.sh 一致。生产接线未验收，不要按本文档上线。

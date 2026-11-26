@@ -27,9 +27,14 @@ fi
 # 生成请求 ID
 REQUEST_ID="jenkins-$(date +%s)-${COMMIT:0:8}"
 
-# Spool 目录（通过挂载的 /opt/inspect-platform）
-# 测试可通过 SPOOL_DIR 环境变量覆盖
-SPOOL="${SPOOL_DIR:-/opt/inspect-platform/data/deploy-spool}"
+# Spool 在控制面，不在应用 data。测试可用 SPOOL_DIR 覆盖。
+SPOOL="${SPOOL_DIR:-/var/lib/inspect-deploy/spool}"
+case "${SPOOL}" in
+    /opt/inspect-platform/data|/opt/inspect-platform/data/*)
+        echo "ERROR: spool must not be under /opt/inspect-platform/data: ${SPOOL}" >&2
+        exit 1
+        ;;
+esac
 
 # 确保目录存在
 mkdir -p "${SPOOL}"

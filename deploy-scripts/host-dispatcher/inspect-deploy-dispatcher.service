@@ -1,28 +1,53 @@
 [Unit]
-Description=Inspect Platform Deploy Dispatcher (Trusted Source)
-After=network.target docker.service
+Description=Inspect Deploy Dispatcher
+Documentation=https://github.com/zhushuai0825/inspect-platform
+After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-ExecStart=/usr/bin/python3 /opt/inspect-deploy/dispatcher.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
+User=inspect-dispatcher
+Group=inspect-deploy
+WorkingDirectory=/var/lib/inspect-deploy
 
-# 安全加固
-PrivateTmp=yes
-NoNewPrivileges=yes
+# 特权边界：本进程不是 root。生产发布只通过 sudo 执行
+# /opt/inspect-deploy/bin/inspect-release（见 sudoers-inspect-deploy）。
+# 不能设置 NoNewPrivileges=yes：那会阻止 sudo 的 setuid，release 实际仍是
+# inspect-dispatcher。不能把 CapabilityBoundingSet 设为空：空边界集令 sudo
+# 无法完成到 root 的凭证切换（setgid/chown 失败）。这两项因此故意不写。
+# 候选测试仍由 release 调用的 runner 在容器内以 uid 65534 执行，不在这里裸跑。
+
+# 控制面 /opt/inspect-deploy 只读（ProtectSystem=strict，且不在 ReadWritePaths）。
+# 配置 root:inspect-deploy 0640，本进程的 Group 能读。
+# 应用树 /opt/inspect-platform 与控制面分离。secret/mail/sqlite 仍是 root 0600，
+# dispatcher 用户写不了。release 经 sudo 后继承这个挂载命名空间，所以发布要写的
+# 应用树必须列在下面。spool 是 /var/lib/inspect-deploy/spool，包含在
+# /var/lib/inspect-deploy 里，不把 /opt/inspect-platform/data 当作队列。
+# runner-stage 同样在 /var/lib/inspect-deploy 下。
 ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/opt/inspect-deploy /opt/inspect-platform/data/deploy-spool /opt/inspect-ops
+ReadWritePaths=/opt/inspect-platform
+ReadWritePaths=/opt/inspect-ops/state
+ReadWritePaths=/var/lib/inspect-deploy
 
-# 资源限制
-MemoryLimit=512M
-CPUQuota=50%
-TasksMax=50
+# /tmp 是私有的，dockerd 看不见。runner 暂存不得放在 /tmp。
+PrivateTmp=yes
+
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/usr/bin/python3 /opt/inspect-deploy/bin/dispatcher.py
+
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target

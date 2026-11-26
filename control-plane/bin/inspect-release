@@ -1,0 +1,42 @@
+#!/bin/bash
+# 控制面固定入口。root:root 0755。
+# sudoers 只允许 inspect-dispatcher 执行这一个路径。
+# 它只 exec 固定的 /opt/inspect-deploy/bin/release.py，不接受解释器、脚本路径或候选源码。
+set -euo pipefail
+
+REAL=/opt/inspect-deploy/bin/release.py
+PY=/usr/bin/python3
+
+reject() {
+    echo '{"ok":false,"code":"RELEASE_HELPER_REJECTED"}'
+    exit 1
+}
+
+if [ ! -x "$PY" ] || [ ! -f "$REAL" ] || [ -L "$REAL" ]; then
+    reject
+fi
+
+cmd="${1:-}"
+case "$cmd" in
+    status|recover)
+        if [ "$#" -ne 1 ]; then
+            reject
+        fi
+        exec "$PY" "$REAL" "$cmd"
+        ;;
+    baseline|deploy|rollback)
+        if [ "$#" -ne 2 ]; then
+            reject
+        fi
+        exec "$PY" "$REAL" "$cmd" "$2"
+        ;;
+    prepare)
+        if [ "$#" -ne 3 ]; then
+            reject
+        fi
+        exec "$PY" "$REAL" prepare "$2" "$3"
+        ;;
+    *)
+        reject
+        ;;
+esac

@@ -1,0 +1,16 @@
+#!/bin/bash
+# 固定可信隔离 runner。
+# 安装位置: /opt/inspect-deploy/bin/run-candidate-tests
+# Owner: root:root 0755
+#
+# root 才调用它。它不在宿主上执行候选 Python。
+# 暂存和 docker 参数在 stage_runner.py，root 不接受路径覆盖。
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: run-candidate-tests refuses to execute candidate code without the root staging step" >&2
+    exit 1
+fi
+
+exec /usr/bin/python3 /opt/inspect-deploy/bin/stage_runner.py run "$@"

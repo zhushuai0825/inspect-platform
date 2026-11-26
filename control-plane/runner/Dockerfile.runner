@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+# 最小依赖（持久可复现）
+# 注意：apt可能慢，使用国内镜像或离线包
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 验证Python
+RUN python3 --version
+
+# Runner入口脚本
+COPY runner-entrypoint.sh /runner-entrypoint.sh
+RUN chmod 755 /runner-entrypoint.sh
+
+# 非root用户（容器内nobody）
+USER nobody:nogroup
+
+ENTRYPOINT ["/runner-entrypoint.sh"]

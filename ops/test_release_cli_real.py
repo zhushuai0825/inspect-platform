@@ -48,6 +48,10 @@ class TestReleaseCLIReal(unittest.TestCase):
         self.sandbox_root.mkdir(parents=True)
         self.sandbox_state.mkdir(parents=True)
         
+        # 设置测试runner（使用fake-runner-success）
+        runner_path = Path(__file__).parent.parent / 'tests' / 'fixtures' / 'fake-runner-success'
+        os.environ['RELEASE_TEST_RUNNER_PATH'] = str(runner_path)
+        
         # 创建最小源码（满足 REQUIRED）
         required_files = {
             '.gitignore': '*.pyc\n',
