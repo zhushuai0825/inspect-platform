@@ -53,6 +53,8 @@
 sudo bash control-plane/INSTALL-CONTROL-PLANE.sh
 ```
 
+不带 `INSTALL_ROOT` 时，脚本会创建 `inspect-deploy` 组和 `inspect-dispatcher` 用户。带 `INSTALL_ROOT` 的前缀安装只写该前缀下的副本，不调用 `useradd` / `groupadd`。`INSTALL_ROOT` 不能落在 `/opt`、`/var`、`/var/lib`、`/etc` 这类父路径上，也不能落在 `/opt/inspect-platform`、`/opt/inspect-ops`、`/opt/inspect-deploy`、`/var/lib/inspect-deploy` 或 `/etc/sudoers.d` 里面。
+
 脚本会安装这些控制面路径：
 
 - `/opt/inspect-deploy`（程序、配置、unit 副本、runner 定义）

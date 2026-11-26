@@ -51,8 +51,32 @@ def _exists(name, kind):
     return proc.returncode == 0
 
 
-def _snapshot(paths):
-    proc = _run(['sudo', '-n', sys.executable, __file__, '--snapshot'] + list(paths))
+def sudo_works():
+    """返回 (可用, 原因, sudo 路径或 None)。找不到 sudo 时不抛异常。"""
+    if os.geteuid() == 0:
+        return True, 'already root', None
+    sudo = shutil.which('sudo')
+    if not sudo:
+        return False, 'sudo executable not found', None
+    try:
+        proc = subprocess.run(
+            [sudo, '-n', 'true'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+    except OSError as exc:
+        return False, 'sudo not executable: {}'.format(exc), None
+    if proc.returncode != 0:
+        return False, 'passwordless sudo to root is not available', sudo
+    return True, 'passwordless sudo', sudo
+
+
+def _snapshot(paths, sudo_bin):
+    cmd = [sys.executable, __file__, '--snapshot'] + list(paths)
+    if sudo_bin:
+        cmd = [sudo_bin, '-n'] + cmd
+    proc = _run(cmd)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr)
     return json.loads(proc.stdout)
@@ -73,10 +97,19 @@ def setUpModule():
 
 
 def tearDownModule():
+    ok, _reason, sudo_bin = sudo_works()
+    if not ok:
+        return
     if not PREEXISTING_USER and _exists('inspect-dispatcher', 'passwd'):
-        _run(['sudo', '-n', 'userdel', 'inspect-dispatcher'])
+        cmd = ['userdel', 'inspect-dispatcher']
+        if sudo_bin:
+            cmd = [sudo_bin, '-n'] + cmd
+        _run(cmd)
     if not PREEXISTING_GROUP and _exists('inspect-deploy', 'group'):
-        _run(['sudo', '-n', 'groupdel', 'inspect-deploy'])
+        cmd = ['groupdel', 'inspect-deploy']
+        if sudo_bin:
+            cmd = [sudo_bin, '-n'] + cmd
+        _run(cmd)
 
 
 def _snapshot_main(paths):
@@ -107,14 +140,26 @@ def _snapshot_main(paths):
 
 class TestInstallControlPlane(unittest.TestCase):
     def setUp(self):
+        ok, reason, sudo_bin = sudo_works()
+        if not ok:
+            self.skipTest(reason)
+        self.sudo = sudo_bin
         self.root = tempfile.mkdtemp(prefix='install-cp-')
         self.addCleanup(self._remove_root)
 
+    def _as_root(self, cmd):
+        if self.sudo:
+            cmd = [self.sudo, '-n'] + cmd
+        return _run(cmd)
+
     def _remove_root(self):
         if os.path.isdir(self.root):
-            proc = _run(['sudo', '-n', 'rm', '-rf', self.root])
+            proc = self._as_root(['rm', '-rf', self.root])
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr)
+
+    def _snap(self, paths):
+        return _snapshot(paths, self.sudo)
 
     def _paths(self):
         base = self.root
@@ -132,10 +177,14 @@ class TestInstallControlPlane(unittest.TestCase):
         self.assertEqual(_host_presence(), HOST_BEFORE)
 
     def _run_install(self):
-        return _run([
-            'sudo', '-n', 'env', 'INSTALL_ROOT=' + self.root,
+        return self._as_root([
+            'env', 'INSTALL_ROOT=' + self.root,
             'bash', INSTALL,
         ])
+
+    def _assert_accounts_unchanged(self):
+        self.assertEqual(_exists('inspect-dispatcher', 'passwd'), PREEXISTING_USER)
+        self.assertEqual(_exists('inspect-deploy', 'group'), PREEXISTING_GROUP)
 
     def test_mismatched_production_dirs_stay_and_fail_closed(self):
         owner = os.getuid() if os.getuid() != 0 else 1000
@@ -154,21 +203,20 @@ chmod 644 "$root/opt/inspect-platform/app.py"
 chown root:root "$root/opt/inspect-platform/data/secret.env"
 chmod 600 "$root/opt/inspect-platform/data/secret.env"
 """
-        proc = _run(['sudo', '-n', 'bash', '-c', script, 'bash', self.root, str(owner)])
+        proc = self._as_root(['bash', '-c', script, 'bash', self.root, str(owner)])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        before = _snapshot(self._paths())
-        users_before = _exists('inspect-dispatcher', 'passwd')
+        before = self._snap(self._paths())
 
         result = self._run_install()
 
-        after = _snapshot(self._paths())
+        after = self._snap(self._paths())
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn('Leaving it unchanged.', result.stderr)
         self.assertEqual(before, after)
         self.assertIsNone(after[self._paths()[6]])
         self.assertFalse(os.path.lexists(os.path.join(self.root, 'opt', 'inspect-deploy')))
         self.assertFalse(os.path.lexists(os.path.join(self.root, 'var', 'lib', 'inspect-deploy')))
-        self.assertEqual(_exists('inspect-dispatcher', 'passwd'), users_before)
+        self._assert_accounts_unchanged()
         self._assert_host_untouched()
 
     def test_live_layout_keeps_dirs_and_spool_is_not_under_data(self):
@@ -188,13 +236,13 @@ chmod 644 "$root/opt/inspect-platform/app.py"
 chmod 600 "$root/opt/inspect-platform/data/secret.env"
 chmod 700 "$root/opt/inspect-ops" "$root/opt/inspect-ops/state"
 """
-        proc = _run(['sudo', '-n', 'bash', '-c', script, 'bash', self.root, str(owner)])
+        proc = self._as_root(['bash', '-c', script, 'bash', self.root, str(owner)])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        before = _snapshot(self._paths())
+        before = self._snap(self._paths())
 
         result = self._run_install()
 
-        after = _snapshot(self._paths())
+        after = self._snap(self._paths())
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in self._paths():
             if path.endswith('deploy-spool'):
@@ -202,20 +250,23 @@ chmod 700 "$root/opt/inspect-ops" "$root/opt/inspect-ops/state"
             else:
                 self.assertEqual(before[path], after[path], path)
         spool = os.path.join(self.root, 'var', 'lib', 'inspect-deploy', 'spool')
-        spool_meta = _snapshot([spool])[spool]
+        spool_meta = self._snap([spool])[spool]
         self.assertIsNotNone(spool_meta)
         self.assertEqual(spool_meta['mode'], 0o750)
-        passwd = _run(['getent', 'passwd', 'inspect-dispatcher'])
-        group = _run(['getent', 'group', 'inspect-deploy'])
-        self.assertEqual(passwd.returncode, 0, passwd.stderr)
-        self.assertEqual(group.returncode, 0, group.stderr)
-        uid = int(passwd.stdout.split(':')[2])
-        gid = int(group.stdout.split(':')[2])
-        self.assertEqual(spool_meta['uid'], uid)
-        self.assertEqual(spool_meta['gid'], gid)
+        self._assert_accounts_unchanged()
+        if PREEXISTING_USER and PREEXISTING_GROUP:
+            passwd = _run(['getent', 'passwd', 'inspect-dispatcher'])
+            group = _run(['getent', 'group', 'inspect-deploy'])
+            self.assertEqual(passwd.returncode, 0, passwd.stderr)
+            self.assertEqual(group.returncode, 0, group.stderr)
+            self.assertEqual(spool_meta['uid'], int(passwd.stdout.split(':')[2]))
+            self.assertEqual(spool_meta['gid'], int(group.stdout.split(':')[2]))
+        else:
+            self.assertEqual(spool_meta['uid'], 0)
+            self.assertEqual(spool_meta['gid'], 0)
         config_path = os.path.join(
             self.root, 'opt', 'inspect-deploy', 'config', 'deploy-config.json')
-        config_proc = _run(['sudo', '-n', 'cat', config_path])
+        config_proc = self._as_root(['cat', config_path])
         self.assertEqual(config_proc.returncode, 0, config_proc.stderr)
         config = json.loads(config_proc.stdout)
         self.assertEqual(config['spool_dir'], '/var/lib/inspect-deploy/spool')
@@ -228,7 +279,7 @@ chmod 700 "$root/opt/inspect-ops" "$root/opt/inspect-ops/state"
         self.assertIn('ReadWritePaths=/var/lib/inspect-deploy', unit)
         self.assertNotIn('/opt/inspect-platform/data/deploy-spool', unit)
         sudoers = os.path.join(self.root, 'etc', 'sudoers.d', 'inspect-deploy')
-        sudoers_meta = _snapshot([sudoers])[sudoers]
+        sudoers_meta = self._snap([sudoers])[sudoers]
         self.assertIsNotNone(sudoers_meta)
         self.assertEqual(sudoers_meta['mode'], 0o440)
         self.assertFalse(os.path.lexists('/etc/sudoers.d/inspect-deploy') and not HOST_BEFORE['/etc/sudoers.d/inspect-deploy'])
@@ -251,15 +302,15 @@ chmod 644 "$root/opt/inspect-platform/app.py"
 chmod 600 "$root/opt/inspect-platform/data/secret.env"
 chmod 700 "$root/opt/inspect-ops"
 """
-        proc = _run(['sudo', '-n', 'bash', '-c', script, 'bash', self.root, str(owner)])
+        proc = self._as_root(['bash', '-c', script, 'bash', self.root, str(owner)])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         ops = os.path.join(self.root, 'opt', 'inspect-ops')
         state = os.path.join(ops, 'state')
-        before = _snapshot([ops, state])
+        before = self._snap([ops, state])
 
         result = self._run_install()
 
-        after = _snapshot([ops, state])
+        after = self._snap([ops, state])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(before[ops]['mode'], after[ops]['mode'])
         self.assertEqual(before[ops]['uid'], after[ops]['uid'])
@@ -272,6 +323,7 @@ chmod 700 "$root/opt/inspect-ops"
         self.assertEqual(after[state]['gid'], 0)
         self.assertFalse(os.path.lexists(
             os.path.join(self.root, 'opt', 'inspect-platform', 'data', 'deploy-spool')))
+        self._assert_accounts_unchanged()
         self._assert_host_untouched()
 
     def test_symlink_platform_fails_without_following_it(self):
@@ -285,19 +337,116 @@ printf 'keep\\n' > "$root/elsewhere/marker"
 chmod 755 "$root/elsewhere"
 ln -s "$root/elsewhere" "$root/opt/inspect-platform"
 """
-        proc = _run(['sudo', '-n', 'bash', '-c', script, 'bash', self.root])
+        proc = self._as_root(['bash', '-c', script, 'bash', self.root])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        before = _snapshot([target, os.path.join(target, 'marker'), link])
+        before = self._snap([target, os.path.join(target, 'marker'), link])
 
         result = self._run_install()
 
-        after = _snapshot([target, os.path.join(target, 'marker'), link])
+        after = self._snap([target, os.path.join(target, 'marker'), link])
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn('Leaving it unchanged.', result.stderr)
         self.assertIn('symlink', result.stderr)
         self.assertEqual(before, after)
         self.assertFalse(os.path.lexists(
             os.path.join(self.root, 'opt', 'inspect-platform', 'data', 'deploy-spool')))
+        self._assert_accounts_unchanged()
+        self._assert_host_untouched()
+
+    def _assert_prefix_rejected(self, install_root, polluted):
+        before = {}
+        for path in polluted:
+            before[path] = os.path.lexists(path)
+        result = self._as_root(['env', 'INSTALL_ROOT=' + install_root, 'bash', INSTALL])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('Leaving it unchanged.', result.stderr)
+        for path in polluted:
+            self.assertEqual(os.path.lexists(path), before[path], path)
+        self._assert_accounts_unchanged()
+        self._assert_host_untouched()
+        return result
+
+    def test_parent_prefix_opt_is_rejected(self):
+        result = self._assert_prefix_rejected('/opt', (
+            '/opt/opt',
+            '/opt/var',
+            '/opt/etc',
+            '/opt/inspect-deploy',
+            '/var/lib/inspect-deploy',
+            '/etc/sudoers.d/inspect-deploy',
+        ))
+        self.assertIn('parent of', result.stderr)
+
+    def test_parent_prefix_var_lib_and_etc_are_rejected(self):
+        self._assert_prefix_rejected('/var/lib', (
+            '/var/lib/opt',
+            '/var/lib/var',
+            '/var/lib/etc',
+            '/var/lib/inspect-deploy',
+        ))
+        self._assert_prefix_rejected('/etc', (
+            '/etc/opt',
+            '/etc/var',
+            '/etc/etc',
+            '/etc/sudoers.d/inspect-deploy',
+        ))
+
+    def test_symlink_to_opt_prefix_is_rejected(self):
+        link = os.path.join(self.root, 'link-to-opt')
+        os.symlink('/opt', link)
+        self._assert_prefix_rejected(link, (
+            '/opt/opt',
+            '/opt/var',
+            '/opt/etc',
+            '/opt/inspect-deploy',
+        ))
+
+    def test_unprefixed_install_creates_accounts_only_inside_namespace(self):
+        work = tempfile.mkdtemp(prefix='install-ns-')
+        self.addCleanup(lambda: self._as_root(['rm', '-rf', work]))
+        script = r"""
+set -euo pipefail
+work="$1"
+install_sh="$2"
+mkdir -p "$work/opt" "$work/varlib" "$work/etc/sudoers.d"
+cp -a /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/login.defs /etc/nsswitch.conf "$work/etc/"
+cp -a /etc/sudoers "$work/etc/sudoers"
+if [ -d /etc/sudoers.d ]; then
+    cp -a /etc/sudoers.d/. "$work/etc/sudoers.d/" || true
+fi
+unshare --mount bash -c "
+set -euo pipefail
+mount --bind '$work/etc' /etc
+mount --bind '$work/opt' /opt
+mount --bind '$work/varlib' /var/lib
+env -u INSTALL_ROOT bash '$install_sh'
+getent passwd inspect-dispatcher
+getent group inspect-deploy
+test -d /opt/inspect-deploy/bin
+test -d /var/lib/inspect-deploy/spool
+test ! -e /opt/inspect-platform/data/deploy-spool
+"
+"""
+        result = self._as_root(['bash', '-c', script, 'bash', work, INSTALL])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('inspect-dispatcher', result.stdout)
+        self.assertIn('inspect-deploy', result.stdout)
+        opt_bin = os.path.join(work, 'opt', 'inspect-deploy', 'bin')
+        spool = os.path.join(work, 'varlib', 'inspect-deploy', 'spool')
+        self.assertEqual(self._as_root(['test', '-d', opt_bin]).returncode, 0)
+        self.assertEqual(self._as_root(['test', '-d', spool]).returncode, 0)
+        spool_meta = self._snap([spool])[spool]
+        ns_uid = None
+        for line in result.stdout.splitlines():
+            if line.startswith('inspect-dispatcher:'):
+                ns_uid = int(line.split(':')[2])
+        self.assertIsNotNone(ns_uid)
+        self.assertEqual(spool_meta['uid'], ns_uid)
+        self.assertNotEqual(ns_uid, 0)
+        self._assert_accounts_unchanged()
+        self.assertFalse(os.path.lexists('/opt/inspect-deploy'))
+        self.assertFalse(os.path.lexists('/var/lib/inspect-deploy'))
+        self.assertFalse(os.path.lexists('/etc/sudoers.d/inspect-deploy'))
         self._assert_host_untouched()
 
 

@@ -2,6 +2,10 @@
 # 控制面安装脚本
 # 执行：sudo bash INSTALL-CONTROL-PLANE.sh
 # 在 control-plane/ 目录中运行。测试可设置绝对路径 INSTALL_ROOT，只改该前缀下的副本。
+# INSTALL_ROOT 不能是 /opt/inspect-platform、/opt/inspect-ops、/opt/inspect-deploy、
+# /var/lib/inspect-deploy、/etc/sudoers.d 本身、它们的子路径，或它们的父路径（例如 /opt）。
+# 带 INSTALL_ROOT 的安装不创建宿主账户。不带 INSTALL_ROOT 的正式安装仍会创建
+# inspect-deploy 组和 inspect-dispatcher 用户。
 #
 # 不 systemctl enable/start，不创建 Jenkins Job，不读取 data/secret.env，
 # 不把文件拷进 Jenkins 家目录或 /opt/inspect-ops/scripts。
@@ -32,14 +36,26 @@ if [ -n "$INSTALL_ROOT" ] && [ "$INSTALL_ROOT" != "/" ]; then
             ;;
     esac
     RESOLVED_ROOT=$(readlink -f "$INSTALL_ROOT")
-    case "$RESOLVED_ROOT" in
-        /opt/inspect-platform|/opt/inspect-platform/*|\
-        /opt/inspect-ops|/opt/inspect-ops/*|\
-        /opt/inspect-deploy|/opt/inspect-deploy/*)
-            echo "ERROR: INSTALL_ROOT must not resolve inside /opt/inspect-platform, /opt/inspect-ops, or /opt/inspect-deploy" >&2
-            exit 1
-            ;;
-    esac
+    for protected in \
+        /opt/inspect-platform \
+        /opt/inspect-ops \
+        /opt/inspect-deploy \
+        /var/lib/inspect-deploy \
+        /etc/sudoers.d
+    do
+        case "$RESOLVED_ROOT" in
+            "$protected"|"$protected"/*)
+                echo "ERROR: INSTALL_ROOT resolves inside ${protected}. Leaving it unchanged." >&2
+                exit 1
+                ;;
+        esac
+        case "$protected" in
+            "$RESOLVED_ROOT"|"$RESOLVED_ROOT"/*)
+                echo "ERROR: INSTALL_ROOT ${RESOLVED_ROOT} is a parent of ${protected}. Refusing this prefix. Leaving it unchanged." >&2
+                exit 1
+                ;;
+        esac
+    done
 fi
 
 p() {
@@ -175,12 +191,33 @@ cd "$(dirname "$0")"
 
 echo "=== 控制面安装 ==="
 
-if ! getent group inspect-deploy >/dev/null; then
-    groupadd --system inspect-deploy
+PREFIX_INSTALL=0
+if [ -n "$INSTALL_ROOT" ] && [ "$INSTALL_ROOT" != "/" ]; then
+    PREFIX_INSTALL=1
 fi
-if ! getent passwd inspect-dispatcher >/dev/null; then
-    useradd --system --gid inspect-deploy --home-dir /var/lib/inspect-deploy \
-        --shell /usr/sbin/nologin inspect-dispatcher
+
+# 前缀安装只写 INSTALL_ROOT 下面的副本，不改宿主账户库。
+# 正式安装（没有 INSTALL_ROOT）仍然创建服务账户。
+if [ "$PREFIX_INSTALL" -eq 0 ]; then
+    if ! getent group inspect-deploy >/dev/null; then
+        groupadd --system inspect-deploy
+    fi
+    if ! getent passwd inspect-dispatcher >/dev/null; then
+        useradd --system --gid inspect-deploy --home-dir /var/lib/inspect-deploy \
+            --shell /usr/sbin/nologin inspect-dispatcher
+    fi
+fi
+
+if getent group inspect-deploy >/dev/null && getent passwd inspect-dispatcher >/dev/null; then
+    RUN_USER=inspect-dispatcher
+    RUN_GROUP=inspect-deploy
+elif [ "$PREFIX_INSTALL" -eq 0 ]; then
+    echo "ERROR: service accounts were not created" >&2
+    exit 1
+else
+    echo "WARNING: prefix install did not create host accounts; prefixed files are root-owned" >&2
+    RUN_USER=root
+    RUN_GROUP=root
 fi
 
 DEPLOY=$(p /opt/inspect-deploy)
@@ -190,11 +227,11 @@ install -d -o root -g root -m 0755 "$DEPLOY/bin"
 install -d -o root -g root -m 0755 "$DEPLOY/config"
 install -d -o root -g root -m 0755 "$DEPLOY/runner"
 install -d -o root -g root -m 0755 "$DEPLOY/systemd"
-install -d -o root -g inspect-deploy -m 0750 "$VARLIB"
-install -d -o inspect-dispatcher -g inspect-deploy -m 0750 "$VARLIB/work"
+install -d -o root -g "$RUN_GROUP" -m 0750 "$VARLIB"
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0750 "$VARLIB/work"
 install -d -o root -g root -m 0700 "$VARLIB/backups"
 install -d -o root -g root -m 0755 "$VARLIB/runner-stage"
-install -d -o inspect-dispatcher -g inspect-deploy -m 0750 "$VARLIB/spool"
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0750 "$VARLIB/spool"
 
 install -o root -g root -m 0755 bin/run-candidate-tests "$DEPLOY/bin/run-candidate-tests"
 install -o root -g root -m 0755 bin/inspect-release "$DEPLOY/bin/inspect-release"
@@ -211,7 +248,7 @@ else
     echo "WARNING: dispatcher.py not found, skipping" >&2
 fi
 
-install -o root -g inspect-deploy -m 0640 config/deploy-config.json "$DEPLOY/config/deploy-config.json"
+install -o root -g "$RUN_GROUP" -m 0640 config/deploy-config.json "$DEPLOY/config/deploy-config.json"
 install -o root -g root -m 0644 ../deploy-scripts/host-dispatcher/inspect-deploy-dispatcher.service \
     "$DEPLOY/systemd/inspect-deploy-dispatcher.service"
 
