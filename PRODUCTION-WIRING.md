@@ -53,8 +53,7 @@
 ```
 /opt/inspect-platform/
 ├── source/                     # 应用源码 (当前版本符号链接)
-├── data/                       # 应用数据 (持久)
-│   ├── deploy-spool/          # Dispatcher spool
+├── data/                       # 应用数据 (持久，不是部署队列)
 │   ├── db/                    # 数据库
 │   ├── reports/               # 报告
 │   └── secrets/               # 秘密
@@ -250,7 +249,7 @@ def execute_deploy(artifact_path, commit):
 {
   "repo_url": "https://github.com/zhushuai0825/inspect-platform.git",
   "branch": "main",
-  "spool_dir": "/opt/inspect-platform/data/deploy-spool",
+  "spool_dir": "/var/lib/inspect-deploy/spool",
   "work_dir": "/var/lib/inspect-deploy/work",
   "log_file": "/var/lib/inspect-deploy/dispatcher.log"
 }

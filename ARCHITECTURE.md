@@ -45,7 +45,7 @@ Jenkins 轮询（Freestyle Job）
         ↓
 ├─ 触发部署 ──────────────────────────────┤
 │   写入部署通知到宿主 spool：             │
-│   - /opt/inspect-platform/data/deploy-spool/
+│   - /var/lib/inspect-deploy/spool/
 │   - 通知格式：request_id + commit SHA   │
 │   - （或空通知）                         │
         ↓
@@ -106,7 +106,7 @@ docker run --rm --network inspect-test-net ...
 
 Jenkins 写入（通过挂载）：
 ```bash
-/opt/inspect-platform/data/deploy-spool/request-<timestamp>.json
+/var/lib/inspect-deploy/spool/request-<timestamp>.json
 ```
 
 格式：
@@ -241,8 +241,8 @@ set -euo pipefail
 COMMIT="$1"
 REQUEST_ID="jenkins-$(date +%s)-${COMMIT:0:8}"
 
-# 写入部署通知（通过挂载的 /opt/inspect-platform）
-SPOOL="/opt/inspect-platform/data/deploy-spool"
+# 写入部署通知到控制面 spool，不写应用 data
+SPOOL="/var/lib/inspect-deploy/spool"
 mkdir -p "${SPOOL}"
 
 REQUEST_FILE="${SPOOL}/request-${REQUEST_ID}.json"
@@ -273,7 +273,7 @@ echo "Dispatcher 将验证并部署"
 {
   "repo_url": "https://github.com/zhushuai0825/inspect-platform.git",
   "branch": "main",
-  "spool_dir": "/opt/inspect-platform/data/deploy-spool",
+  "spool_dir": "/var/lib/inspect-deploy/spool",
   "work_dir": "/opt/inspect-deploy/work"
 }
 ```

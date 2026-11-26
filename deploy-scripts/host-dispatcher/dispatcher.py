@@ -35,7 +35,7 @@ CONFIG_FILE = Path('/opt/inspect-deploy/config/deploy-config.json')
 DEFAULT_CONFIG = {
     'repo_url': 'https://github.com/zhushuai0825/inspect-platform.git',
     'branch': 'main',
-    'spool_dir': '/opt/inspect-platform/data/deploy-spool',
+    'spool_dir': '/var/lib/inspect-deploy/spool',
     'work_dir': '/var/lib/inspect-deploy/work',
     'log_file': '/var/lib/inspect-deploy/dispatcher.log'
 }
@@ -43,6 +43,15 @@ DEFAULT_CONFIG = {
 # 控制面固定入口。root 调用 release.py；非 root 生产进程只允许 sudo 这个 helper。
 FIXED_RELEASE_PY = '/opt/inspect-deploy/bin/release.py'
 FIXED_RELEASE_HELPER = '/opt/inspect-deploy/bin/inspect-release'
+APP_DATA_DIR = '/opt/inspect-platform/data'
+
+
+def assert_spool_outside_app_data(spool):
+    """部署队列必须在控制面下，不能放进应用 data。本函数不创建目录。"""
+    text = os.path.realpath(str(spool))
+    data = os.path.realpath(APP_DATA_DIR)
+    if text == data or text.startswith(data + os.sep):
+        raise ValueError('spool must not be under application data {}: {}'.format(data, text))
 
 def load_config():
     """
@@ -861,16 +870,16 @@ def main():
     log('  Work: {}'.format(WORK_DIR))
     log('=' * 60)
     
-    # 确保目录存在
-    SPOOL.mkdir(parents=True, exist_ok=True, mode=0o755)
-    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    
-    # 安全检查：spool 及父目录无符号链接
+    # 先拒绝应用 data 下的 spool 和符号链接，再创建目录。
     try:
+        assert_spool_outside_app_data(SPOOL)
         check_no_symlinks(SPOOL)
     except ValueError as e:
         log('致命错误: {}'.format(e))
         sys.exit(1)
+
+    SPOOL.mkdir(parents=True, exist_ok=True, mode=0o750)
+    WORK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     
     while True:
         try:

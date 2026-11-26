@@ -203,13 +203,12 @@ WorkingDirectory=/var/lib/inspect-deploy
 ReadOnlyPaths=/opt/inspect-deploy
 
 # 应用访问（读写）
-# Source: 部署时写入
-# Data/deploy-spool: dispatcher读写
-# State: release写入
+# 不要把应用 data 或 data/deploy-spool 列进 ReadWritePaths。
+# spool 在 /var/lib/inspect-deploy/spool。实际 unit 是
+# deploy-scripts/host-dispatcher/inspect-deploy-dispatcher.service，不要按本草稿安装。
 ProtectSystem=strict
-ReadWritePaths=/opt/inspect-platform/source
-ReadWritePaths=/opt/inspect-platform/data/deploy-spool
-ReadWritePaths=/opt/inspect-platform/state
+ReadWritePaths=/opt/inspect-platform
+ReadWritePaths=/opt/inspect-ops/state
 ReadWritePaths=/var/lib/inspect-deploy
 
 # 安全加固

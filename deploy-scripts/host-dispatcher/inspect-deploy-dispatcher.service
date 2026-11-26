@@ -20,7 +20,9 @@ WorkingDirectory=/var/lib/inspect-deploy
 # 配置 root:inspect-deploy 0640，本进程的 Group 能读。
 # 应用树 /opt/inspect-platform 与控制面分离。secret/mail/sqlite 仍是 root 0600，
 # dispatcher 用户写不了。release 经 sudo 后继承这个挂载命名空间，所以发布要写的
-# 路径必须列在下面。/var/lib/inspect-deploy/runner-stage 包含在该目录里。
+# 应用树必须列在下面。spool 是 /var/lib/inspect-deploy/spool，包含在
+# /var/lib/inspect-deploy 里，不把 /opt/inspect-platform/data 当作队列。
+# runner-stage 同样在 /var/lib/inspect-deploy 下。
 ProtectSystem=strict
 ReadWritePaths=/opt/inspect-platform
 ReadWritePaths=/opt/inspect-ops/state

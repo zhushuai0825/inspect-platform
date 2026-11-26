@@ -25,8 +25,14 @@ HOST_ARTIFACT="${ARTIFACT/\/var\/jenkins_home/\/var\/lib\/docker\/volumes\/jenki
 
 echo "宿主路径: ${HOST_ARTIFACT}"
 
-# 写入部署请求到 spool（通过挂载的 /opt/inspect-platform）
-SPOOL="/opt/inspect-platform/data/deploy-spool"
+# Spool 在控制面。不要在应用 data 下创建目录。
+SPOOL="${SPOOL_DIR:-/var/lib/inspect-deploy/spool}"
+case "${SPOOL}" in
+    /opt/inspect-platform/data|/opt/inspect-platform/data/*)
+        echo "ERROR: spool must not be under /opt/inspect-platform/data: ${SPOOL}" >&2
+        exit 1
+        ;;
+esac
 mkdir -p "${SPOOL}"
 
 TIMESTAMP=$(date +%s)

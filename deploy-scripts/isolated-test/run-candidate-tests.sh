@@ -1,6 +1,6 @@
 #!/bin/bash
 # 隔离候选测试脚本
-# 位置（生产）：/opt/inspect-ops/scripts/run-candidate-tests.sh
+# 旧说明曾把本脚本放到 /opt/inspect-ops/scripts/。那不是安装步骤，安装脚本不会拷贝到那里。
 # 权限：root:root, 755
 # 由 release.py preflight() 调用
 #
