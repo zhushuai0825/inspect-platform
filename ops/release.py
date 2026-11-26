@@ -212,12 +212,8 @@ class Manager:
                         seen.add(name);total+=item.file_size
                         if len(seen)>64 or total>4194304 or item.file_size>1048576:raise ReleaseError('ARCHIVE_LIMIT')
                         target=src/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(z.read(item))
-                # 设置候选源码权限为Docker runner可读（755/644）
-                # Root umask 077产生700/600，需要显式放宽供nobody读取
-                for root_path,dirs,files in os.walk(str(src)):
-                    for d in dirs:os.chmod(os.path.join(root_path,d),0o755)
-                    for f in files:os.chmod(os.path.join(root_path,f),0o644)
-                os.chmod(str(src),0o755)
+                # 候选树保持 umask 0700。交给 runner 复制到受控暂存后再给 nobody 读。
+                # 不在发布状态目录上 chmod 755：那既写不了临时 data，也会把状态树暴露给其他用户。
                 self.manifest(stage,v);self.preflight(src);os.replace(str(stage),str(dest))
                 self.receipt('prepared',version=v)
             finally:
@@ -296,8 +292,16 @@ class Systemd:
         self.systemctl('stop','inspect-mail','inspect-admin','inspect-platform')
     def backup_runtime(self):
         # Private rollback aid, NEVER a source artifact and NEVER restored automatically.
-        dest=Path('/root/backups')/('inspect-release-data-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
-        dest.mkdir(mode=0o700,parents=True)
+        # 备份留在 dispatcher 可写集合内的 root-only 目录，不放进应用树，也不放 /root（ProtectHome 不可写）。
+        state_root=Path('/var/lib/inspect-deploy')
+        if not state_root.exists():
+            state_root.mkdir(mode=0o750)
+            os.chmod(str(state_root),0o750)
+        backup_root=state_root/'backups'
+        backup_root.mkdir(mode=0o700)
+        os.chmod(str(backup_root),0o700)
+        dest=backup_root/('inspect-release-data-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6])
+        dest.mkdir(mode=0o700)
         subprocess.check_call(['tar','-czf',str(dest/'data.tar.gz'),'-C',str(self.root),'data'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120)
         os.chmod(str(dest/'data.tar.gz'),0o600);return str(dest)
     def start_front(self):self.systemctl('start','inspect-platform','inspect-admin')

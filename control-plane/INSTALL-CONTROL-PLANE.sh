@@ -1,102 +1,96 @@
 #!/bin/bash
 # 控制面安装脚本
 # 执行：sudo bash INSTALL-CONTROL-PLANE.sh
+# 在 control-plane/ 目录中运行。
 #
-# 功能：
-# 1. 创建 /opt/inspect-deploy/ 目录结构
-# 2. 安装控制面文件（release.py, dispatcher.py, runner）
-# 3. 设置权限（root:root, 不可覆盖）
-# 4. 构建runner镜像
-# 5. 验证安装
+# 不 systemctl enable/start，不创建 Jenkins Job，不读取 data/secret.env。
+# Docker 镜像只在 docker build 退出码为 0 时才算建成；本脚本不会把跳过说成成功。
 
 set -euo pipefail
 
-# 检查root权限
 if [ "$EUID" -ne 0 ]; then
     echo "ERROR: Must run as root (use sudo)" >&2
     exit 1
 fi
 
+cd "$(dirname "$0")"
+
 echo "=== 控制面安装 ==="
-echo ""
 
-# 1. 创建目录结构
-echo "[1/6] 创建 /opt/inspect-deploy/ 目录..."
-mkdir -p /opt/inspect-deploy/{bin,config,runner,systemd}
-chown -R root:root /opt/inspect-deploy
-chmod 755 /opt/inspect-deploy
+if ! getent group inspect-deploy >/dev/null; then
+    groupadd --system inspect-deploy
+fi
+if ! getent passwd inspect-dispatcher >/dev/null; then
+    useradd --system --gid inspect-deploy --home-dir /var/lib/inspect-deploy \
+        --shell /usr/sbin/nologin inspect-dispatcher
+fi
 
-# 2. 安装bin文件
-echo "[2/6] 安装控制面二进制文件..."
-cp bin/run-candidate-tests /opt/inspect-deploy/bin/
-chown root:root /opt/inspect-deploy/bin/run-candidate-tests
-chmod 755 /opt/inspect-deploy/bin/run-candidate-tests
+install -d -o root -g root -m 0755 /opt/inspect-deploy/bin
+install -d -o root -g root -m 0755 /opt/inspect-deploy/config
+install -d -o root -g root -m 0755 /opt/inspect-deploy/runner
+install -d -o root -g root -m 0755 /opt/inspect-deploy/systemd
+install -d -o root -g inspect-deploy -m 0750 /var/lib/inspect-deploy
+install -d -o inspect-dispatcher -g inspect-deploy -m 0750 /var/lib/inspect-deploy/work
+install -d -o root -g root -m 0700 /var/lib/inspect-deploy/backups
+install -d -o root -g root -m 0755 /var/lib/inspect-deploy/runner-stage
+install -d -o root -g root -m 0755 /opt/inspect-platform
+# 0711：dispatcher 能按路径进入 spool，不能列出 data 里的秘密文件名以外的需求；
+# 秘密文件本身保持 root:root 0600，本脚本不读取、不放宽它们。
+install -d -o root -g root -m 0711 /opt/inspect-platform/data
+install -d -o inspect-dispatcher -g inspect-deploy -m 0750 /opt/inspect-platform/data/deploy-spool
+install -d -o root -g root -m 0755 /opt/inspect-ops
+install -d -o root -g root -m 0700 /opt/inspect-ops/state
 
-# 注意：release.py和dispatcher.py需要从main repo复制
-if [ ! -f "../ops/release.py" ]; then
+install -o root -g root -m 0755 bin/run-candidate-tests /opt/inspect-deploy/bin/run-candidate-tests
+install -o root -g root -m 0755 bin/inspect-release /opt/inspect-deploy/bin/inspect-release
+install -o root -g root -m 0755 bin/stage_runner.py /opt/inspect-deploy/bin/stage_runner.py
+
+if [ -f ../ops/release.py ]; then
+    install -o root -g root -m 0755 ../ops/release.py /opt/inspect-deploy/bin/release.py
+else
     echo "WARNING: ops/release.py not found, skipping" >&2
-else
-    cp ../ops/release.py /opt/inspect-deploy/bin/release.py
-    chown root:root /opt/inspect-deploy/bin/release.py
-    chmod 755 /opt/inspect-deploy/bin/release.py
 fi
-
-if [ ! -f "../deploy-scripts/host-dispatcher/dispatcher.py" ]; then
+if [ -f ../deploy-scripts/host-dispatcher/dispatcher.py ]; then
+    install -o root -g root -m 0755 ../deploy-scripts/host-dispatcher/dispatcher.py /opt/inspect-deploy/bin/dispatcher.py
+else
     echo "WARNING: dispatcher.py not found, skipping" >&2
-else
-    cp ../deploy-scripts/host-dispatcher/dispatcher.py /opt/inspect-deploy/bin/dispatcher.py
-    chown root:root /opt/inspect-deploy/bin/dispatcher.py
-    chmod 755 /opt/inspect-deploy/bin/dispatcher.py
 fi
 
-# 3. 安装配置
-echo "[3/6] 安装固定配置..."
-cp config/deploy-config.json /opt/inspect-deploy/config/
-chown root:root /opt/inspect-deploy/config/deploy-config.json
-chmod 644 /opt/inspect-deploy/config/deploy-config.json
+install -o root -g inspect-deploy -m 0640 config/deploy-config.json /opt/inspect-deploy/config/deploy-config.json
+install -o root -g root -m 0644 ../deploy-scripts/host-dispatcher/inspect-deploy-dispatcher.service \
+    /opt/inspect-deploy/systemd/inspect-deploy-dispatcher.service
 
-# 4. 安装runner文件
-echo "[4/6] 安装runner文件..."
 cp runner/* /opt/inspect-deploy/runner/
 chown -R root:root /opt/inspect-deploy/runner
+chmod 755 /opt/inspect-deploy/runner
 chmod 755 /opt/inspect-deploy/runner/*.sh
+chmod 644 /opt/inspect-deploy/runner/Dockerfile.runner
 
-# 5. 构建runner镜像
-echo "[5/6] 构建runner镜像..."
-cd /opt/inspect-deploy/runner/
+# sudoers 只包含固定 helper。校验失败就删掉，不留半份规则。
+install -o root -g root -m 0440 \
+    ../deploy-scripts/host-dispatcher/sudoers-inspect-deploy /etc/sudoers.d/inspect-deploy
+if ! visudo -cf /etc/sudoers; then
+    rm -f /etc/sudoers.d/inspect-deploy
+    echo "ERROR: sudoers rejected" >&2
+    exit 1
+fi
 
-if command -v docker &> /dev/null; then
+# 不复制到 /etc/systemd，不 daemon-reload，不 enable。操作者自行安装 unit。
+echo "Unit 已放到 /opt/inspect-deploy/systemd/ （未启用）"
+
+if command -v docker >/dev/null 2>&1; then
     echo "Building inspect-platform-runner:v1..."
-    docker build -t inspect-platform-runner:v1 -f Dockerfile.runner .
-    echo "✓ Runner镜像构建成功"
+    if docker build -t inspect-platform-runner:v1 -f /opt/inspect-deploy/runner/Dockerfile.runner /opt/inspect-deploy/runner; then
+        echo "Runner image build exited 0"
+    else
+        echo "ERROR: docker build failed; image is not built" >&2
+        exit 1
+    fi
 else
-    echo "WARNING: Docker not found, skipping runner build" >&2
-    echo "Please manually build: docker build -t inspect-platform-runner:v1 -f /opt/inspect-deploy/runner/Dockerfile.runner /opt/inspect-deploy/runner/" >&2
+    echo "WARNING: docker not found; runner image was NOT built" >&2
 fi
 
-cd -
-
-# 6. 验证
-echo "[6/6] 验证安装..."
-echo ""
-echo "控制面文件："
-ls -la /opt/inspect-deploy/bin/ | grep -E "release|dispatcher|run-candidate"
-echo ""
-echo "配置文件："
-ls -la /opt/inspect-deploy/config/
-echo ""
-
-if command -v docker &> /dev/null; then
-    echo "Runner镜像："
-    docker image inspect inspect-platform-runner:v1 --format '{{.RepoTags}}' || echo "WARNING: Runner镜像未找到"
-fi
-
-echo ""
-echo "=== 安装完成 ==="
-echo ""
-echo "下一步："
-echo "1. 验证权限：ls -la /opt/inspect-deploy/bin/"
-echo "2. 验证runner：docker image inspect inspect-platform-runner:v1"
-echo "3. 测试runner：sudo /opt/inspect-deploy/bin/run-candidate-tests /path/to/candidate"
-echo "4. 配置sudo：/etc/sudoers.d/inspect-deploy"
-echo "5. 更新systemd service"
+echo "=== 文件权限 ==="
+ls -la /opt/inspect-deploy/bin
+ls -la /opt/inspect-deploy/config
+echo "未启动服务，未创建 Jenkins Job。"

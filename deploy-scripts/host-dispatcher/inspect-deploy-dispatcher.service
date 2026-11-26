@@ -9,23 +9,26 @@ User=inspect-dispatcher
 Group=inspect-deploy
 WorkingDirectory=/var/lib/inspect-deploy
 
-# 控制面配置（group readable）
-# /opt/inspect-deploy/config: config.json group=inspect-deploy mode=640
+# 特权边界：本进程不是 root。生产发布只通过 sudo 执行
+# /opt/inspect-deploy/bin/inspect-release（见 sudoers-inspect-deploy）。
+# 不能设置 NoNewPrivileges=yes：那会阻止 sudo 的 setuid，release 实际仍是
+# inspect-dispatcher。不能把 CapabilityBoundingSet 设为空：空边界集令 sudo
+# 无法完成到 root 的凭证切换（setgid/chown 失败）。这两项因此故意不写。
+# 候选测试仍由 release 调用的 runner 在容器内以 uid 65534 执行，不在这里裸跑。
 
-# 应用访问（读写）
-# /opt/inspect-platform: 应用根目录
-# /opt/inspect-ops/state: release版本状态（实际路径）
-# /var/lib/inspect-deploy: dispatcher工作目录（work/log）
+# 控制面 /opt/inspect-deploy 只读（ProtectSystem=strict，且不在 ReadWritePaths）。
+# 配置 root:inspect-deploy 0640，本进程的 Group 能读。
+# 应用树 /opt/inspect-platform 与控制面分离。secret/mail/sqlite 仍是 root 0600，
+# dispatcher 用户写不了。release 经 sudo 后继承这个挂载命名空间，所以发布要写的
+# 路径必须列在下面。/var/lib/inspect-deploy/runner-stage 包含在该目录里。
 ProtectSystem=strict
 ReadWritePaths=/opt/inspect-platform
 ReadWritePaths=/opt/inspect-ops/state
 ReadWritePaths=/var/lib/inspect-deploy
 
-# 临时目录（Git clone等）
+# /tmp 是私有的，dockerd 看不见。runner 暂存不得放在 /tmp。
 PrivateTmp=yes
 
-# 安全加固
-NoNewPrivileges=yes
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -36,19 +39,11 @@ LockPersonality=yes
 MemoryDenyWriteExecute=no
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# 能力限制
-# dispatcher需要调用sudo执行release.py
-# 通过 /etc/sudoers.d/inspect-deploy 配置sudo权限
-CapabilityBoundingSet=
-
-# 环境
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 
-# 启动命令
 ExecStart=/usr/bin/python3 /opt/inspect-deploy/bin/dispatcher.py
 
-# 重启策略
 Restart=on-failure
 RestartSec=10s
 

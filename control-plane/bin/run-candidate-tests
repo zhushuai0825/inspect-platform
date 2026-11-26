@@ -1,52 +1,16 @@
 #!/bin/bash
-# 固定可信隔离runner调用脚本
-# Owner: root:root 755
+# 固定可信隔离 runner。
 # 安装位置: /opt/inspect-deploy/bin/run-candidate-tests
+# Owner: root:root 0755
 #
-# 功能：在隔离容器中执行候选测试
-# 安全：非root、只读候选、临时data、network=none、资源限制
+# root 才调用它。它不在宿主上执行候选 Python。
+# 暂存和 docker 参数在 stage_runner.py，root 不接受路径覆盖。
 
 set -euo pipefail
 
-# 参数
-CANDIDATE_SRC="${1:?Missing candidate source directory}"
-
-# 验证候选源码目录
-if [ ! -d "$CANDIDATE_SRC" ]; then
-    echo "ERROR: Candidate source not found: $CANDIDATE_SRC" >&2
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: run-candidate-tests refuses to execute candidate code without the root staging step" >&2
     exit 1
 fi
 
-# Runner镜像
-RUNNER_IMAGE="inspect-platform-runner:v1"
-
-# 检查runner镜像存在
-if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
-    echo "ERROR: Runner image not found: $RUNNER_IMAGE" >&2
-    echo "Please build: docker build -f /opt/inspect-deploy/runner/Dockerfile.runner -t $RUNNER_IMAGE /opt/inspect-deploy/runner/" >&2
-    exit 2
-fi
-
-# 创建临时data目录（权限允许Docker nobody写入）
-TEMP_DATA=$(mktemp -d /tmp/preflight-data-XXXXXX)
-chmod 755 "$TEMP_DATA"  # 允许nobody遍历和读取
-trap "rm -rf '$TEMP_DATA'" EXIT
-
-# 执行测试（隔离容器）
-docker run --rm \
-    --read-only \
-    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-    --network=none \
-    --cap-drop=ALL \
-    --security-opt=no-new-privileges \
-    --pids-limit=100 \
-    --memory=384m \
-    --cpus=0.5 \
-    --user=nobody:nogroup \
-    -v "${CANDIDATE_SRC}:/candidate:ro" \
-    -v "${TEMP_DATA}:/data:rw" \
-    -e "QA_DATA_DIR=/data" \
-    "$RUNNER_IMAGE" \
-    /candidate
-
-# 返回码：0=成功，非0=失败
+exec /usr/bin/python3 /opt/inspect-deploy/bin/stage_runner.py run "$@"

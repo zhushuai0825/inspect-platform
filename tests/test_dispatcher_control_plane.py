@@ -143,89 +143,66 @@ class TestDispatcherControlPlane(unittest.TestCase):
         
         self.assertIn('traversal', str(cm.exception).lower())
     
-    @patch('os.geteuid')
-    def test_root_mode_fixed_path(self, mock_geteuid):
-        """测试：Root模式固定路径，不可覆盖"""
-        mock_geteuid.return_value = 0  # 模拟root
-        
-        # 创建控制面目录结构
-        control_plane = Path(self.test_dir) / 'opt' / 'inspect-deploy' / 'bin'
-        control_plane.mkdir(parents=True, mode=0o755)
-        
-        release_py = control_plane / 'release.py'
-        release_py.write_text('# control plane')
-        release_py.chmod(0o755)
-        
-        # 设置env试图覆盖
+    def test_root_mode_fixed_path(self):
+        """Root 分支必须调用产品函数。euid 在这里打桩；真实 euid 0 由 proof 覆盖。"""
         os.environ['RELEASE_CLI'] = '/tmp/fake.py'
-        
-        # 模拟CONFIG试图覆盖
+        os.environ['RELEASE_ROOT'] = '/tmp/evil-root'
+        os.environ['RELEASE_TEST_SANDBOX'] = '/tmp/a:/tmp/b'
         old_config = dispatcher.CONFIG.copy()
         dispatcher.CONFIG['release_cli'] = '/tmp/another_fake.py'
-        dispatcher.CONFIG['RELEASE_ROOT'] = '/tmp/sandbox'  # 试图激活测试模式
-        
+        dispatcher.CONFIG['RELEASE_ROOT'] = '/tmp/sandbox'
+        dispatcher.CONFIG['release_root'] = '/tmp/sandbox'
         try:
-            # 直接测试路径选择逻辑（从execute_deploy提取）
-            with patch('os.geteuid', return_value=0):
-                # Root模式：应该固定返回控制面路径
-                # 不论CONFIG/env有什么
-                if os.geteuid() == 0:
-                    selected_path = Path('/opt/inspect-deploy/bin/release.py')
-                else:
-                    raise Exception('Should be root mode')
-                
-                # 验证选择的是固定路径
-                self.assertEqual(
-                    str(selected_path),
-                    '/opt/inspect-deploy/bin/release.py'
-                )
-                
-                # 验证不是env或CONFIG指定的路径
-                self.assertNotEqual(str(selected_path), '/tmp/fake.py')
-                self.assertNotEqual(str(selected_path), '/tmp/another_fake.py')
+            with patch('dispatcher.os.geteuid', return_value=0):
+                decision = dispatcher.resolve_release_invocation()
+            self.assertEqual(decision['release_py'], '/opt/inspect-deploy/bin/release.py')
+            self.assertEqual(
+                decision['command_prefix'],
+                ['/usr/bin/python3', '/opt/inspect-deploy/bin/release.py'],
+            )
+            self.assertFalse(decision['is_test_sandbox'])
+            self.assertFalse(decision['use_sudo'])
+            env = dispatcher.release_child_env(False)
+            self.assertNotIn('RELEASE_CLI', env)
+            self.assertNotIn('RELEASE_ROOT', env)
+            self.assertNotIn('RELEASE_TEST_SANDBOX', env)
         finally:
             dispatcher.CONFIG.clear()
             dispatcher.CONFIG.update(old_config)
-    
-    @patch('os.geteuid')
-    def test_nonroot_requires_explicit_release_cli(self, mock_geteuid):
-        """测试：非root要求显式RELEASE_CLI，不允许任意注入"""
-        mock_geteuid.return_value = 1000  # 模拟非root
-        
-        # 清除RELEASE_CLI
+
+    def test_nonroot_without_release_cli_uses_sudo_helper(self):
+        """非 root 且没有 RELEASE_CLI 时走固定 helper，不能因 CONFIG 进入测试注入。"""
         if 'RELEASE_CLI' in os.environ:
             del os.environ['RELEASE_CLI']
-        
-        # 测试路径选择逻辑
-        with patch('os.geteuid', return_value=1000):
-            # 非root且未设置RELEASE_CLI：应该失败
-            if os.geteuid() != 0:
-                release_cli = os.environ.get('RELEASE_CLI')
-                self.assertIsNone(release_cli)
-                # 产品代码会抛出异常
-    
-    @patch('os.geteuid')
-    def test_nonroot_explicit_release_cli_allowed(self, mock_geteuid):
-        """测试：非root显式RELEASE_CLI允许沙盒注入"""
-        mock_geteuid.return_value = 1000  # 模拟非root
-        
-        # 创建测试release
+        old_config = dispatcher.CONFIG.copy()
+        dispatcher.CONFIG['RELEASE_ROOT'] = '/tmp/sandbox'
+        dispatcher.CONFIG['release_cli'] = '/tmp/not-explicit.py'
+        try:
+            with patch('dispatcher.os.geteuid', return_value=1000):
+                decision = dispatcher.resolve_release_invocation()
+            self.assertFalse(decision['is_test_sandbox'])
+            self.assertTrue(decision['use_sudo'])
+            self.assertEqual(decision['release_py'], '/opt/inspect-deploy/bin/release.py')
+            self.assertEqual(
+                decision['command_prefix'],
+                ['sudo', '-n', '--', '/opt/inspect-deploy/bin/inspect-release'],
+            )
+        finally:
+            dispatcher.CONFIG.clear()
+            dispatcher.CONFIG.update(old_config)
+
+    def test_nonroot_explicit_release_cli_allowed(self):
+        """非 root 且显式 RELEASE_CLI 才允许测试注入，并且不 sudo。"""
         test_release = Path(self.test_dir) / 'test_release.py'
         test_release.write_text('# test')
         test_release.chmod(0o755)
-        
-        # 显式设置RELEASE_CLI
         os.environ['RELEASE_CLI'] = str(test_release)
-        
-        # 测试路径选择逻辑
-        with patch('os.geteuid', return_value=1000):
-            if os.geteuid() != 0:
-                release_cli = os.environ.get('RELEASE_CLI')
-                self.assertEqual(release_cli, str(test_release))
-                selected_path = Path(release_cli)
-                
-                # 验证选择的是env指定的路径
-                self.assertEqual(str(selected_path), str(test_release))
+        with patch('dispatcher.os.geteuid', return_value=1000):
+            decision = dispatcher.resolve_release_invocation()
+        self.assertTrue(decision['is_test_sandbox'])
+        self.assertFalse(decision['use_sudo'])
+        self.assertEqual(decision['release_py'], str(test_release))
+        self.assertEqual(decision['command_prefix'], [sys.executable, str(test_release)])
 
 if __name__ == '__main__':
     unittest.main()

@@ -597,15 +597,15 @@ class T(unittest.TestCase):
         # 5. 运行 dispatcher
         result = self.run_dispatcher_once(timeout=60)
         
-        # 6. 验证部署失败（preflight 阻止）
-        # Dispatcher 应该非零退出（部署失败）
-        self.assertNotEqual(result.returncode, 0,
-            'Dispatcher should fail when preflight fails')
-        
-        # 验证是preflight失败阻止（不是其他错误）
+        # 6. 精确断言产品错误码。MISSING_REQUIRED_SOURCE 或其他失败不能让本用例变绿。
         output = result.stdout + result.stderr
-        self.assertIn('PREFLIGHT_RUNNER_FAILED', output,
-            'Should fail with PREFLIGHT_RUNNER_FAILED, not other error')
+        self.assertNotEqual(result.returncode, 0,
+            'Dispatcher should fail when preflight fails: {}'.format(output))
+        self.assertIn('"code": "PREFLIGHT_RUNNER_FAILED"', output,
+            'Should fail with PREFLIGHT_RUNNER_FAILED, not another error: {}'.format(output))
+        self.assertNotIn('MISSING_REQUIRED_SOURCE', output)
+        self.assertNotIn('ROOT_SSH_ONLY', output)
+        self.assertNotIn('RELEASE_HELPER_REJECTED', output)
         
         # 7. 验证旧版本不变
         current = json.loads((self.release_state / 'current.json').read_text())

@@ -48,31 +48,31 @@
 ### 2.1 创建目录结构
 
 ```bash
-# 以 root 身份操作
-sudo mkdir -p /opt/inspect-deploy/{work,logs}
-sudo mkdir -p /opt/inspect-platform/data/deploy-spool
-sudo mkdir -p /opt/inspect-ops/scripts
-
-# 设置权限
-sudo chmod 700 /opt/inspect-deploy
-sudo chmod 755 /opt/inspect-platform/data/deploy-spool
+# 以 root 身份操作。控制面与应用树分开，应用目录不是 /source。
+# 完整步骤见 control-plane/INSTALL-CONTROL-PLANE.sh。这里只列与 dispatcher 读配置有关的权限。
+sudo install -d -o root -g root -m 0755 /opt/inspect-deploy/bin /opt/inspect-deploy/config
+sudo install -d -o root -g inspect-deploy -m 0750 /var/lib/inspect-deploy
+sudo install -d -o inspect-dispatcher -g inspect-deploy -m 0750 /var/lib/inspect-deploy/work
+sudo install -d -o root -g root -m 0700 /var/lib/inspect-deploy/backups
+sudo install -d -o root -g root -m 0755 /var/lib/inspect-deploy/runner-stage
+sudo install -d -o root -g root -m 0711 /opt/inspect-platform/data
+sudo install -d -o inspect-dispatcher -g inspect-deploy -m 0750 /opt/inspect-platform/data/deploy-spool
+sudo install -d -o root -g root -m 0700 /opt/inspect-ops/state
 ```
 
 ### 2.2 安装 Dispatcher
 
 ```bash
-# 复制主程序
-sudo cp dispatcher.py /opt/inspect-deploy/
-sudo chmod 755 /opt/inspect-deploy/dispatcher.py
-sudo chown root:root /opt/inspect-deploy/dispatcher.py
+# 复制主程序到控制面。dispatcher 用户不能写这个目录。
+sudo install -o root -g root -m 0755 dispatcher.py /opt/inspect-deploy/bin/dispatcher.py
+sudo install -o root -g root -m 0755 ../../control-plane/bin/inspect-release /opt/inspect-deploy/bin/inspect-release
 
-# 创建配置
-sudo cp config.json.example /opt/inspect-deploy/config.json
-sudo chmod 600 /opt/inspect-deploy/config.json
-sudo chown root:root /opt/inspect-deploy/config.json
+# 配置给 inspect-deploy 组读，不使用 root-only 0600（服务用户会在 import 时 PermissionError）。
+# 也不使用 0644。文件里没有 secret.env / mail.env。
+sudo install -o root -g inspect-deploy -m 0640 config.json.example /opt/inspect-deploy/config/deploy-config.json
 
 # 编辑配置（如需要）
-sudo vi /opt/inspect-deploy/config.json
+sudo vi /opt/inspect-deploy/config/deploy-config.json
 ```
 
 **配置说明**：
@@ -146,7 +146,7 @@ python3 tests/test_e2e_local.py
 # 验证配置文件
 sudo python3 -c "
 import json
-with open('/opt/inspect-deploy/config.json') as f:
+with open('/opt/inspect-deploy/config/deploy-config.json') as f:
     config = json.load(f)
 print('Repo:', config['repo_url'])
 print('Branch:', config['branch'])
@@ -180,7 +180,7 @@ cat > /tmp/test-spool/request-manual-test.json <<EOF
 EOF
 
 # 手动运行 dispatcher（一次）
-# 注意：需要修改 config.json 指向 /tmp/test-spool
+# 注意：需要修改 deploy-config.json 指向 /tmp/test-spool
 # 或环境变量覆盖
 ```
 
@@ -225,7 +225,7 @@ sudo tail -f /opt/inspect-deploy/dispatcher.log
 
 ```bash
 # 备份配置
-sudo cp /opt/inspect-deploy/config.json /opt/inspect-deploy/config.json.backup-$(date +%Y%m%d-%H%M%S)
+sudo cp /opt/inspect-deploy/config/deploy-config.json /opt/inspect-deploy/config/deploy-config.json.backup-$(date +%Y%m%d-%H%M%S)
 
 # 备份程序
 sudo cp /opt/inspect-deploy/dispatcher.py /opt/inspect-deploy/dispatcher.py.backup-$(date +%Y%m%d-%H%M%S)
@@ -256,17 +256,17 @@ sudo rm -rf /opt/inspect-deploy
 ### 6.1 文件权限
 
 ```bash
-# Dispatcher 程序
-sudo ls -l /opt/inspect-deploy/dispatcher.py
+# Dispatcher 程序（控制面，root 拥有，目录不可被 dispatcher 用户写入）
+sudo ls -l /opt/inspect-deploy/bin/dispatcher.py /opt/inspect-deploy/bin/inspect-release
 # 应为：-rwxr-xr-x root root
 
-# 配置文件
-sudo ls -l /opt/inspect-deploy/config.json
-# 应为：-rw------- root root
+# 配置文件（组 inspect-deploy 可读，与 service 的 Group= 一致）
+sudo ls -l /opt/inspect-deploy/config/deploy-config.json
+# 应为：-rw-r----- root inspect-deploy
 
-# 工作目录
-sudo ls -ld /opt/inspect-deploy/work
-# 应为：drwx------ root root
+# 工作目录在控制面外面
+sudo ls -ld /var/lib/inspect-deploy/work
+# 应为：drwxr-x--- inspect-dispatcher inspect-deploy
 ```
 
 ### 6.2 配置检查
@@ -302,7 +302,7 @@ sudo journalctl -u inspect-deploy-dispatcher -n 50
 python3 --version
 
 # 检查配置文件
-sudo python3 -c "import json; print(json.load(open('/opt/inspect-deploy/config.json')))"
+sudo python3 -c "import json; print(json.load(open('/opt/inspect-deploy/config/deploy-config.json')))"
 ```
 
 ### 7.2 请求未处理

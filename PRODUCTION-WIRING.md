@@ -252,12 +252,11 @@ def execute_deploy(artifact_path, commit):
   "branch": "main",
   "spool_dir": "/opt/inspect-platform/data/deploy-spool",
   "work_dir": "/var/lib/inspect-deploy/work",
-  "release_root": "/opt/inspect-platform",
-  "release_state": "/opt/inspect-platform/state"
+  "log_file": "/var/lib/inspect-deploy/dispatcher.log"
 }
 ```
 
-**权限**: root:root 644（只读，不可被应用覆盖）
+**权限**: root:inspect-deploy 0640。服务用户通过 Group=inspect-deploy 读取。不要做成 0600（非 root 打不开），也不要做成 0644。发布状态在 `/opt/inspect-ops/state`，由 root 的 release.py 写入，不在应用源码目录，也不是 `/source`。
 
 ---
 
@@ -274,7 +273,7 @@ After=network.target
 Type=simple
 User=inspect
 Group=inspect
-WorkingDirectory=/opt/inspect-platform/source
+WorkingDirectory=/opt/inspect-platform
 
 # 安全加固
 NoNewPrivileges=yes
@@ -283,8 +282,6 @@ PrivateTmp=yes
 # 最小权限：允许必要写入
 ProtectSystem=strict
 ReadWritePaths=/opt/inspect-platform/data
-ReadWritePaths=/opt/inspect-platform/source
-ReadWritePaths=/opt/inspect-platform/state
 
 # 其他保护
 ProtectHome=yes
@@ -292,7 +289,7 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
 
-ExecStart=/usr/bin/python3 /opt/inspect-platform/source/app.py
+ExecStart=/usr/bin/python3 /opt/inspect-platform/app.py
 
 [Install]
 WantedBy=multi-user.target
@@ -413,10 +410,9 @@ sudo docker build -t inspect-platform-runner:v1 -f Dockerfile.runner .
 ### 4. 安装配置
 
 ```bash
-# 复制固定配置
-sudo cp deploy-scripts/config/deploy-config.json /opt/inspect-deploy/config/
-sudo chown root:root /opt/inspect-deploy/config/deploy-config.json
-sudo chmod 644 /opt/inspect-deploy/config/deploy-config.json
+# 复制固定配置。组可读，不是 0644，也不是 root-only 0600。
+sudo install -o root -g inspect-deploy -m 0640 \
+  control-plane/config/deploy-config.json /opt/inspect-deploy/config/deploy-config.json
 ```
 
 ### 5. 验证安装
@@ -440,17 +436,14 @@ cat /opt/inspect-deploy/config/deploy-config.json
 ### `/etc/sudoers.d/inspect-deploy`
 
 ```
-# Dispatcher用户（非root）调用控制面release CLI
-inspect-dispatcher ALL=(root) NOPASSWD: /opt/inspect-deploy/bin/release.py prepare *, \
-                                         /opt/inspect-deploy/bin/release.py deploy *, \
-                                         /opt/inspect-deploy/bin/release.py rollback *
-
-# 限制：
-# - 只能调用固定路径 /opt/inspect-deploy/bin/release.py
-# - 只能执行 prepare/deploy/rollback命令
-# - 不能执行其他命令
-# - 不能修改控制面文件
+# 只允许固定 helper。helper 内部 exec /usr/bin/python3 /opt/inspect-deploy/bin/release.py。
+# 不把 sudo 授给 python、可写源码或 /opt/inspect-platform。
+Defaults:inspect-dispatcher !requiretty
+Defaults:inspect-dispatcher env_reset
+inspect-dispatcher ALL=(root) NOPASSWD: /opt/inspect-deploy/bin/inspect-release
 ```
+
+dispatcher 的 unit 不能同时写 `NoNewPrivileges=yes` 或空的 `CapabilityBoundingSet=`。前者让 sudo 无法 setuid；后者让 sudo 无法切到 root。候选测试不由这个 sudo 在宿主上裸跑，runner 在容器里使用 uid 65534。仓库里的规则文件是 `deploy-scripts/host-dispatcher/sudoers-inspect-deploy`。
 
 ---
 
@@ -458,31 +451,13 @@ inspect-dispatcher ALL=(root) NOPASSWD: /opt/inspect-deploy/bin/release.py prepa
 
 ### 备份
 
-```bash
-# 备份当前版本（部署前）
-sudo cp -a /opt/inspect-platform/source /opt/inspect-platform/backup/source-$(date +%Y%m%d-%H%M%S)
-
-# 备份state
-sudo cp -a /opt/inspect-platform/state /opt/inspect-platform/backup/state-$(date +%Y%m%d-%H%M%S)
-
-# 备份data（可选，视大小而定）
-sudo rsync -a /opt/inspect-platform/data/ /opt/inspect-platform/backup/data-$(date +%Y%m%d-%H%M%S)/
-```
+发布状态在 `/opt/inspect-ops/state`，不在 `/opt/inspect-platform/source`。运行数据备份由 release.py 写到 `/var/lib/inspect-deploy/backups`（root:root 0700）。不要把 `data/`、`secret.env`、`mail.env` 或 sqlite 打进源码包。
 
 ### 回滚
 
 ```bash
-# 使用release CLI回滚到已知版本
-sudo /opt/inspect-deploy/bin/release.py rollback <version>
-
-# 或手动回滚
-sudo systemctl stop inspect-platform
-sudo rm /opt/inspect-platform/source
-sudo ln -s /opt/inspect-platform/state/releases/<old-version>/source /opt/inspect-platform/source
-sudo systemctl start inspect-platform
-
-# 验证
-curl http://localhost:8000/health
+# 固定控制面入口。不要对应用树做通配 sudo，也不要用软链把发布目录指回应用树。
+sudo /opt/inspect-deploy/bin/inspect-release rollback <version>
 ```
 
 ---
@@ -574,5 +549,5 @@ sudo /opt/inspect-deploy/bin/run-candidate-tests /tmp/test-candidate
 2. /opt/inspect-deploy由root独占，inspect用户只读
 3. /opt/inspect-platform/{source,data,state}由inspect用户管理
 4. Jenkins容器以root运行，只用于通知（不执行repo代码）
-5. Dispatcher以非root用户运行，通过sudo调用控制面release
-6. Runner容器完全隔离，无生产目录/secret/socket访问
+5. Dispatcher以 inspect-dispatcher 运行，只 sudo 固定 helper `/opt/inspect-deploy/bin/inspect-release`。unit 不启用 NoNewPrivileges，也不清空 CapabilityBoundingSet。
+6. Runner 只挂载受控暂存里的候选（只读）和 nobody 拥有的临时 data。不挂生产 data、不挂控制面、不挂 Docker socket。

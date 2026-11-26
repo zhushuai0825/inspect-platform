@@ -1,0 +1,6 @@
+# inspect-dispatcher 只能通过固定控制面 helper 变成 root。
+# helper 再执行 /opt/inspect-deploy/bin/release.py。
+# 这里没有 python -c，没有可写源码通配，也没有 /opt/inspect-platform。
+Defaults:inspect-dispatcher !requiretty
+Defaults:inspect-dispatcher env_reset
+inspect-dispatcher ALL=(root) NOPASSWD: /opt/inspect-deploy/bin/inspect-release

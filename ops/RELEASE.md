@@ -48,7 +48,7 @@ python3 -m unittest test_release -v
 
 ## 数据、配置与升级限制
 
-- 私有备份可能含真实凭证，仅保存在 `/root/backups` 700目录，归档600；它们不是源码包，不能上传GitHub或发到公开页面。
+- 私有备份可能含真实凭证，仅保存在 `/var/lib/inspect-deploy/backups`（root:root 0700，归档 0600）。该目录在 dispatcher 的可写路径里，但不在应用树、不进容器、不入库。不能上传 GitHub 或发到公开页面。
 - 运行数据备份在真正发布暂停服务后生成，位于 `inspect-release-data-*/data.tar.gz`；仅供人工灾难恢复，不自动恢复。
 - 目前只支持兼容旧版本的代码/附加式schema更新；破坏性数据库迁移不属于本工具能力，须另做迁移与恢复设计。
 - `deploy/*.service` 只是模板，工具不改 `/etc/systemd/system`；不部署 nginx、Jenkins Job、宿主机软件或依赖。ops 工具自身也不随应用发布自动替换，升级需单独评审安装。

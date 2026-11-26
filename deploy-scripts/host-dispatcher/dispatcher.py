@@ -29,15 +29,20 @@ from pathlib import Path
 # Python 3.6 兼容：不使用 capture_output
 PYTHON36_COMPAT = sys.version_info < (3, 7)
 
-# 配置（由 root 拥有的配置文件加载）
-CONFIG_FILE = Path('/opt/inspect-deploy/config.json')
+# 配置（控制面，root:inspect-deploy 0640；不放 secret/mail/sqlite）
+# 应用树是 /opt/inspect-platform，不是 /source，也不是控制面目录。
+CONFIG_FILE = Path('/opt/inspect-deploy/config/deploy-config.json')
 DEFAULT_CONFIG = {
     'repo_url': 'https://github.com/zhushuai0825/inspect-platform.git',
     'branch': 'main',
     'spool_dir': '/opt/inspect-platform/data/deploy-spool',
-    'work_dir': '/opt/inspect-deploy/work',
-    'log_file': '/opt/inspect-deploy/dispatcher.log'
+    'work_dir': '/var/lib/inspect-deploy/work',
+    'log_file': '/var/lib/inspect-deploy/dispatcher.log'
 }
+
+# 控制面固定入口。root 调用 release.py；非 root 生产进程只允许 sudo 这个 helper。
+FIXED_RELEASE_PY = '/opt/inspect-deploy/bin/release.py'
+FIXED_RELEASE_HELPER = '/opt/inspect-deploy/bin/inspect-release'
 
 def load_config():
     """
@@ -310,6 +315,38 @@ def fetch_source(repo_url, commit, work_dir):
             shutil.rmtree(str(clone_dir))
         raise
 
+def assert_packable_source(source_dir, file_path):
+    """
+    白名单成员必须是源码目录内的普通文件。
+
+    拒绝软链（含中间目录软链）和解析后落到源码目录外的路径。
+    硬链接可以在不经过路径检查的情况下把目录外 inode 带进包，同样拒绝。
+    """
+    source_dir = Path(source_dir)
+    relative = Path(file_path)
+    if relative.is_absolute() or '..' in relative.parts:
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise Exception('源码软链不允许: {}'.format(file_path))
+    src_file = source_dir / relative
+    if not src_file.is_file():
+        raise Exception('源码路径非普通文件: {}'.format(file_path))
+    source_resolved = source_dir.resolve()
+    src_resolved = src_file.resolve()
+    try:
+        src_resolved.relative_to(source_resolved)
+    except ValueError:
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    if src_resolved != src_file.absolute():
+        raise Exception('源码路径逃逸: {}'.format(file_path))
+    stat_info = src_file.lstat()
+    if stat_info.st_nlink > 1:
+        raise Exception('源码硬链接不允许: {}'.format(file_path))
+    return src_file
+
 def create_artifact(source_dir, commit):
     """
     创建部署制品（白名单过滤）
@@ -342,31 +379,21 @@ def create_artifact(source_dir, commit):
     with zipfile.ZipFile(str(artifact_path), 'w', zipfile.ZIP_DEFLATED) as z:
         for file_path in sorted(WHITELIST):
             src_file = source_dir / file_path
-            
-            # 安全检查：拒绝软链、确保在源码目录内
+            # exists() 会跟随软链。悬空软链不能当成“文件缺失”跳过。
+            current = source_dir
+            for part in Path(file_path).parts:
+                current = current / part
+                if current.is_symlink():
+                    raise Exception('源码软链不允许: {}'.format(file_path))
+
+            # 缺失文件跳过；存在的成员必须是源码目录内的普通文件
             if not src_file.exists():
                 missing_count += 1
                 log('警告: 白名单文件缺失: {}'.format(file_path))
                 continue
-            
-            # 拒绝符号链接
-            if src_file.is_symlink():
-                raise Exception('源码软链不允许: {}'.format(file_path))
-            
-            # 验证规范化路径在源码目录内
-            src_resolved = src_file.resolve()
-            source_resolved = source_dir.resolve()
-            try:
-                src_resolved.relative_to(source_resolved)
-            except ValueError:
-                raise Exception('源码路径逃逸: {}'.format(file_path))
-            
-            if src_file.is_file():
-                z.write(str(src_file), 'inspect-platform/' + file_path)
-                packed_count += 1
-            else:
-                missing_count += 1
-                log('警告: 白名单路径非普通文件: {}'.format(file_path))
+            assert_packable_source(source_dir, file_path)
+            z.write(str(src_file), 'inspect-platform/' + file_path)
+            packed_count += 1
     
     if not artifact_path.exists():
         raise Exception('制品未创建')
@@ -486,71 +513,92 @@ def verify_trusted_path(path_str, description='path', check_ancestors=True):
     
     return True
 
+def resolve_release_invocation():
+    """
+    决定 release 入口。只看调用时的 euid，不看 CONFIG 里有没有 RELEASE_ROOT。
+
+    euid==0：始终是 /usr/bin/python3 /opt/inspect-deploy/bin/release.py。
+    CONFIG、RELEASE_CLI、RELEASE_ROOT、RELEASE_TEST_* 都不改变路径，也不 sudo。
+
+    euid!=0 且环境里有非空 RELEASE_CLI：测试注入，直接执行该路径，不 sudo。
+    euid!=0 且没有 RELEASE_CLI：生产路径，sudo 固定 helper。
+    helper 再执行固定 release.py。sudoers 不得指向可写源码树。
+    """
+    if os.geteuid() == 0:
+        return {
+            'release_py': FIXED_RELEASE_PY,
+            'use_sudo': False,
+            'is_test_sandbox': False,
+            'command_prefix': ['/usr/bin/python3', FIXED_RELEASE_PY],
+        }
+    release_cli = os.environ.get('RELEASE_CLI') or ''
+    if release_cli:
+        return {
+            'release_py': release_cli,
+            'use_sudo': False,
+            'is_test_sandbox': True,
+            'command_prefix': [sys.executable, release_cli],
+        }
+    return {
+        'release_py': FIXED_RELEASE_PY,
+        'use_sudo': True,
+        'is_test_sandbox': False,
+        'command_prefix': ['sudo', '-n', '--', FIXED_RELEASE_HELPER],
+    }
+
+def release_child_env(is_test_sandbox):
+    """生产子进程不继承测试覆盖。测试沙盒才传递 RELEASE_TEST_SANDBOX。"""
+    cmd_env = os.environ.copy()
+    if not is_test_sandbox:
+        for key in list(cmd_env):
+            if key == 'RELEASE_CLI' or key == 'RELEASE_ROOT' or key == 'RELEASE_STATE' or key.startswith('RELEASE_TEST_'):
+                del cmd_env[key]
+        return cmd_env
+    release_root = CONFIG.get('release_root')
+    release_state = CONFIG.get('release_state')
+    if release_root and release_state:
+        cmd_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(release_root, release_state)
+    cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
+    cmd_env.pop('RELEASE_TEST_SKIP_PREFLIGHT', None)
+    return cmd_env
+
 def execute_deploy(artifact_path, commit):
     """
-    执行部署
-    
-    安全：
-    - 生产：固定调用 /opt/inspect-deploy/bin/release.py
-    - 测试：允许RELEASE_CLI注入（非root）
-    - 验证可信路径（owner/mode/symlink/parent）
+    执行部署。
+
+    路径由 resolve_release_invocation() 决定。root 不能因 CONFIG 或环境变量改走测试入口。
     """
     version = 'v{}-{}'.format(time.strftime('%Y%m%d-%H%M%S'), commit[:8])
     log('部署版本: {}'.format(version))
-    
-    # 确定release路径：生产固定控制面，测试允许沙盒注入
-    # 生产dispatcher（非root）通过sudo调用固定root release
-    # 测试沙盒（非root）使用env注入
-    is_test_sandbox = 'RELEASE_ROOT' in CONFIG or 'RELEASE_CLI' in os.environ
-    
-    if is_test_sandbox:
-        # 测试沙盒：允许明确的RELEASE_CLI env注入
-        release_py_str = os.environ.get('RELEASE_CLI')
-        if not release_py_str:
-            raise Exception('Test sandbox mode requires explicit RELEASE_CLI env')
-        release_py = Path(release_py_str)
-        use_sudo = False
+
+    decision = resolve_release_invocation()
+    is_test_sandbox = decision['is_test_sandbox']
+    use_sudo = decision['use_sudo']
+    release_py = decision['release_py']
+
+    if os.geteuid() == 0 and (is_test_sandbox or use_sudo or release_py != FIXED_RELEASE_PY):
+        raise Exception('root release invocation drifted from the fixed control-plane path')
+
+    if use_sudo:
+        verify_trusted_path(FIXED_RELEASE_HELPER, 'Control plane helper')
+        verify_trusted_path(FIXED_RELEASE_PY, 'Control plane release.py')
+        log('生产模式: sudo {} -> {}'.format(FIXED_RELEASE_HELPER, FIXED_RELEASE_PY))
+    elif is_test_sandbox:
+        verify_trusted_path(release_py, 'Test RELEASE_CLI')
         log('测试沙盒模式: RELEASE_CLI={}'.format(release_py))
     else:
-        # 生产模式：固定控制面，通过sudo调用
-        release_py = Path('/opt/inspect-deploy/bin/release.py')
-        use_sudo = True
-        log('生产模式: 固定控制面 /opt/inspect-deploy/bin/release.py (via sudo)')
-    
-    # 验证release路径安全性
-    verify_trusted_path(str(release_py), 'Control plane release.py')
-    
-    log('release.py 安全验证通过: {}'.format(release_py))
-    
-    # 构建命令
-    if use_sudo:
-        # 生产：通过sudo调用固定release
-        python_cmd = '/usr/bin/python3'
-    else:
-        # 测试：直接调用
-        python_cmd = sys.executable
-    
-    # 测试环境变量
-    cmd_env = os.environ.copy()
-    if 'release_root' in CONFIG:
-        cmd_env['RELEASE_TEST_SANDBOX'] = '{}:{}'.format(
-            CONFIG['release_root'],
-            CONFIG['release_state']
-        )
-        # 不跳过 preflight：实际执行候选测试
-        # cmd_env['RELEASE_TEST_SKIP_PREFLIGHT'] = '1'  # 已移除
-        cmd_env['PYTHONDONTWRITEBYTECODE'] = '1'
-    
+        verify_trusted_path(FIXED_RELEASE_PY, 'Control plane release.py')
+        log('root 生产模式: {}'.format(FIXED_RELEASE_PY))
+
+    log('release 入口安全验证通过: {}'.format(release_py))
+    cmd_env = release_child_env(is_test_sandbox)
+
     # Prepare
     log('执行: prepare (env={})'.format('test' if is_test_sandbox else 'prod'))
     if is_test_sandbox:
         log('测试环境变量: RELEASE_TEST_SANDBOX={}'.format(cmd_env.get('RELEASE_TEST_SANDBOX', 'NOT SET')))
-    cmd = []
-    if use_sudo:
-        cmd.extend(['sudo', python_cmd])
-    else:
-        cmd.append(python_cmd)
-    cmd.extend([str(release_py), 'prepare', str(artifact_path), version])
+    cmd = list(decision['command_prefix'])
+    cmd.extend(['prepare', str(artifact_path), version])
     
     # Python 3.6 兼容
     proc = subprocess.Popen(
@@ -563,19 +611,16 @@ def execute_deploy(artifact_path, commit):
     stdout, stderr = proc.communicate(timeout=300)
     
     if proc.returncode != 0:
-        log('prepare 失败: stdout={} stderr={}'.format(stdout, stderr))
-        raise Exception('prepare 失败: {}'.format(stderr))
+        detail = 'stdout={} stderr={}'.format(stdout, stderr)
+        log('prepare 失败: {}'.format(detail))
+        raise Exception('prepare 失败: {}'.format(detail))
     
     log('prepare 成功: {}'.format(stdout[:200]))
     
     # Deploy
     log('执行: deploy (env={})'.format('test' if is_test_sandbox else 'prod'))
-    cmd = []
-    if use_sudo:
-        cmd.extend(['sudo', python_cmd])
-    else:
-        cmd.append(python_cmd)
-    cmd.extend([str(release_py), 'deploy', version])
+    cmd = list(decision['command_prefix'])
+    cmd.extend(['deploy', version])
     
     proc = subprocess.Popen(
         cmd,
@@ -587,8 +632,9 @@ def execute_deploy(artifact_path, commit):
     stdout, stderr = proc.communicate(timeout=600)
     
     if proc.returncode != 0:
-        log('deploy 失败: stdout={} stderr={}'.format(stdout, stderr))
-        raise Exception('deploy 失败: {}'.format(stderr))
+        detail = 'stdout={} stderr={}'.format(stdout, stderr)
+        log('deploy 失败: {}'.format(detail))
+        raise Exception('deploy 失败: {}'.format(detail))
     
     log('deploy 成功: {}'.format(stdout[:200]))
     
