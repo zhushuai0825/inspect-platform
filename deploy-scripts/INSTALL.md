@@ -83,7 +83,7 @@ sudo bash control-plane/INSTALL-CONTROL-PLANE.sh
 - `branch`: 固定 main（不可由请求更改）
 - `spool_dir`: `/var/lib/inspect-deploy/spool`
 - `work_dir`: `/var/lib/inspect-deploy/work`
-- `log_file`: `/var/lib/inspect-deploy/dispatcher.log`
+- `log_file`: `/var/lib/inspect-deploy/log/dispatcher.log`
 
 ### 2.3 不在本安装里做的事
 
@@ -171,7 +171,7 @@ EOF
 
 `systemctl enable` 和 `systemctl start` 不是安装步骤，本轮没有验收，不要从本文档执行。安装脚本只把 unit 放在 `/opt/inspect-deploy/systemd/`。
 
-日志文件配置为 `/var/lib/inspect-deploy/dispatcher.log`。本文档不要求在生产机上跟踪 journal。
+日志文件配置为 `/var/lib/inspect-deploy/log/dispatcher.log`。该目录属主是 `inspect-dispatcher`，父目录 `/var/lib/inspect-deploy` 仍是 root 所有且组不可写。本文档不要求在生产机上跟踪 journal。
 
 ---
 

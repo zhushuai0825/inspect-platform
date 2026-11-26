@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     'branch': 'main',
     'spool_dir': '/var/lib/inspect-deploy/spool',
     'work_dir': '/var/lib/inspect-deploy/work',
-    'log_file': '/var/lib/inspect-deploy/dispatcher.log'
+    'log_file': '/var/lib/inspect-deploy/log/dispatcher.log'
 }
 
 # 控制面固定入口。root 调用 release.py；非 root 生产进程只允许 sudo 这个 helper。
@@ -100,7 +100,7 @@ def load_config():
 CONFIG = load_config()
 SPOOL = Path(CONFIG['spool_dir'])
 WORK_DIR = Path(CONFIG['work_dir'])
-LOG_FILE = Path(CONFIG.get('log_file', '/tmp/dispatcher.log'))
+LOG_FILE = Path(CONFIG.get('log_file', '/var/lib/inspect-deploy/log/dispatcher.log'))
 
 def log(msg):
     """写日志（Python 3.6 兼容）"""

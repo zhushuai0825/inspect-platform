@@ -251,7 +251,7 @@ def execute_deploy(artifact_path, commit):
   "branch": "main",
   "spool_dir": "/var/lib/inspect-deploy/spool",
   "work_dir": "/var/lib/inspect-deploy/work",
-  "log_file": "/var/lib/inspect-deploy/dispatcher.log"
+  "log_file": "/var/lib/inspect-deploy/log/dispatcher.log"
 }
 ```
 

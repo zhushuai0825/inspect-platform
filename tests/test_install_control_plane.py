@@ -271,6 +271,9 @@ chmod 700 "$root/opt/inspect-ops" "$root/opt/inspect-ops/state"
         config = json.loads(config_proc.stdout)
         self.assertEqual(config['spool_dir'], '/var/lib/inspect-deploy/spool')
         self.assertNotIn('/opt/inspect-platform/data', config['spool_dir'])
+        self.assertEqual(config['log_file'], '/var/lib/inspect-deploy/log/dispatcher.log')
+        log_dir = os.path.join(self.root, 'var', 'lib', 'inspect-deploy', 'log')
+        self.assertEqual(self._as_root(['test', '-d', log_dir]).returncode, 0)
         unit_path = os.path.join(
             self.root, 'opt', 'inspect-deploy', 'systemd',
             'inspect-deploy-dispatcher.service')
@@ -401,6 +404,57 @@ ln -s "$root/elsewhere" "$root/opt/inspect-platform"
             '/opt/inspect-deploy',
         ))
 
+    def test_service_user_appends_log_and_parent_stays_unwritable(self):
+        uid = os.getuid()
+        gid = os.getgid()
+        base = os.path.join(self.root, 'perm-layout')
+        script = """
+import os
+import sys
+base = sys.argv[1]
+uid = int(sys.argv[2])
+gid = int(sys.argv[3])
+dispatcher_dir = sys.argv[4]
+parent = os.path.join(base, 'inspect-deploy')
+logdir = os.path.join(parent, 'log')
+os.makedirs(logdir)
+os.chown(parent, 0, gid)
+os.chmod(parent, 0o750)
+os.chown(logdir, uid, gid)
+os.chmod(logdir, 0o750)
+if os.stat(parent).st_mode & 0o020:
+    raise SystemExit('parent became group-writable')
+os.setgid(gid)
+os.setuid(uid)
+sys.path.insert(0, dispatcher_dir)
+import dispatcher
+good = os.path.join(logdir, 'dispatcher.log')
+bad = os.path.join(parent, 'dispatcher.log')
+dispatcher.LOG_FILE = dispatcher.Path(good)
+dispatcher.log('writable-log')
+dispatcher.log('second-line')
+handle = open(good)
+text = handle.read()
+handle.close()
+if 'writable-log' not in text or 'second-line' not in text:
+    raise SystemExit('append did not land in the service log')
+dispatcher.LOG_FILE = dispatcher.Path(bad)
+try:
+    dispatcher.log('should-fail')
+except PermissionError:
+    pass
+else:
+    raise SystemExit('log in the 0750 parent was writable')
+"""
+        proc = self._as_root([
+            sys.executable, '-c', script, base, str(uid), str(gid), DISPATCHER_DIR,
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        parent = os.path.join(base, 'inspect-deploy')
+        parent_meta = self._snap([parent])[parent]
+        self.assertEqual(parent_meta['uid'], 0)
+        self.assertEqual(parent_meta['mode'], 0o750)
+
     def test_unprefixed_install_creates_accounts_only_inside_namespace(self):
         work = tempfile.mkdtemp(prefix='install-ns-')
         self.addCleanup(lambda: self._as_root(['rm', '-rf', work]))
@@ -443,6 +497,21 @@ test ! -e /opt/inspect-platform/data/deploy-spool
         self.assertIsNotNone(ns_uid)
         self.assertEqual(spool_meta['uid'], ns_uid)
         self.assertNotEqual(ns_uid, 0)
+        parent = os.path.join(work, 'varlib', 'inspect-deploy')
+        log_dir = os.path.join(parent, 'log')
+        parent_meta = self._snap([parent])[parent]
+        log_meta = self._snap([log_dir])[log_dir]
+        self.assertEqual(parent_meta['uid'], 0)
+        self.assertEqual(parent_meta['mode'], 0o750)
+        self.assertEqual(parent_meta['mode'] & 0o020, 0)
+        self.assertEqual(log_meta['uid'], ns_uid)
+        self.assertEqual(log_meta['mode'], 0o750)
+        cfg = self._as_root(['cat', os.path.join(
+            work, 'opt', 'inspect-deploy', 'config', 'deploy-config.json')])
+        self.assertEqual(cfg.returncode, 0, cfg.stderr)
+        self.assertEqual(
+            json.loads(cfg.stdout)['log_file'],
+            '/var/lib/inspect-deploy/log/dispatcher.log')
         self._assert_accounts_unchanged()
         self.assertFalse(os.path.lexists('/opt/inspect-deploy'))
         self.assertFalse(os.path.lexists('/var/lib/inspect-deploy'))
@@ -490,6 +559,10 @@ class TestSpoolNotUnderAppData(unittest.TestCase):
         self.assertEqual(
             dispatcher.DEFAULT_CONFIG['spool_dir'],
             '/var/lib/inspect-deploy/spool',
+        )
+        self.assertEqual(
+            dispatcher.DEFAULT_CONFIG['log_file'],
+            '/var/lib/inspect-deploy/log/dispatcher.log',
         )
         forbidden = '/opt/inspect-platform/data/deploy-spool'
         existed = os.path.lexists(forbidden)
