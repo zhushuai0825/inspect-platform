@@ -51,7 +51,7 @@ docker run --rm \
     apt-get install -y --no-install-recommends nodejs npm > /dev/null 2>&1
     
     echo "=== Python 语法检查 ==="
-    python3 -m py_compile app.py core.py admin.py worker.py notifications.py
+    python3 -m py_compile app.py core.py admin.py worker.py notifications.py publish_board.py
     python3 -m py_compile deploy/update_job.py ops/release.py ops/test_release.py
     
     echo "=== JavaScript 语法检查 ==="

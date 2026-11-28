@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>发布记录 · 本机管理</title><link rel="stylesheet" href="/styles.css?v=4"><link rel="stylesheet" href="/admin.css?v=4"></head><body>
+<div class="shell"><aside class="sidebar"><a href="/" class="brand"><span class="brand-mark">Q</span><span>本机管理<small>LOCAL ADMINISTRATION</small></span></a><div class="nav-label">受保护的配置入口</div><nav><a href="/"><span class="nav-symbol">01</span>巡检配置</a><a href="/publish" class="active"><span class="nav-symbol">02</span>发布记录</a></nav><div class="sidebar-bottom"><a href="http://8.146.206.64/qa/" target="_blank" rel="noopener">打开公开看板 ↗</a><div>仅监听本机 · SSH 隧道访问</div></div></aside>
+<div class="workspace"><header class="topbar"><div class="breadcrumb">质量管理 <span>/</span> <strong>发布记录</strong></div><span class="access-badge">本机管理 · SSH 隧道</span></header><main>
+<div class="page-header"><div><h1>发布记录</h1><p id="lead">记录前端或后端发到本服务器的结果。这里不读取代码仓库的推送或拉取请求。</p></div><div class="actions"><button id="reload" class="button">刷新列表</button></div></div>
+<div class="notice">发布和回滚只在这个本机管理入口执行。未配置对应的 Jenkins 发布任务时，不会写入记录，也不会把状态标成成功。Jenkins 模板在仓库中，尚未安装到现网控制器。</div>
+<div id="message" class="notice hidden" role="status"></div>
+<div class="summary-line" id="summary"></div>
+<section class="panel"><div class="panel-head"><h2>发布到本服务器</h2><span class="muted" id="host-label"></span></div><form id="publish-form" class="editor-form">
+<label>服务 <select name="service"><option value="frontend">前端</option><option value="backend">后端</option></select></label>
+<label>操作者 <input name="actor" maxlength="40" required placeholder="姓名或账号" autocomplete="name"></label>
+<label>版本 <input name="version" maxlength="64" placeholder="例如 2026.11.26" autocomplete="off"></label>
+<label>提交 SHA <input name="commit" maxlength="40" placeholder="7 到 40 位十六进制，可留空" autocomplete="off" spellcheck="false"></label>
+<label>制品标识 <input name="artifact" maxlength="128" placeholder="可选，不是文件路径" autocomplete="off" spellcheck="false"></label>
+<div class="wide form-actions"><button id="publish" type="submit" class="button primary">发布</button><span class="muted">版本和提交至少填一项。同一服务不能同时有两次发布。</span></div>
+</form></section>
+<section class="panel"><div class="panel-head"><h2>记录</h2><span class="muted" id="count"></span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>服务</th><th>操作者</th><th>版本 / 提交 / 制品</th><th>状态</th><th>结果</th><th>操作</th></tr></thead><tbody id="records"><tr><td colspan="7" class="empty">正在读取发布记录…</td></tr></tbody></table></div></section>
+<div class="notice">发布进入成功、失败或已回滚后，会调用现有巡检跑一轮当前已启用的检查，不改动内置的个人站冒烟项。针对本次发布目标单独加检查，尚未接入。</div>
+<footer class="main-footer"><span>发布与回滚只在本机管理入口</span><span>记录保存在本机 SQLite</span></footer>
+</main></div></div><script src="/publish.js?v=4"></script></body></html>

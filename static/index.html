@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#101d35">
   <title>巡检平台 · 质量控制台</title>
-  <link rel="stylesheet" href="./styles.css?v=4">
+  <link rel="stylesheet" href="./styles.css?v=6">
 </head>
 <body>
 <div class="shell">
@@ -16,8 +16,9 @@
       <a href="#/tasks" data-nav="tasks"><span class="nav-symbol" aria-hidden="true">02</span>巡检任务</a>
       <a href="#/reports" data-nav="reports"><span class="nav-symbol" aria-hidden="true">03</span>报告与日志</a>
       <a href="#/events" data-nav="events"><span class="nav-symbol" aria-hidden="true">04</span>失败与恢复</a>
+      <a href="#/releases" data-nav="releases"><span class="nav-symbol" aria-hidden="true">05</span>发布记录</a>
     </nav>
-    <div class="sidebar-bottom"><a href="/jenkins/" target="_blank" rel="noopener">Jenkins 控制台 <span aria-hidden="true">↗</span></a><a href="/">返回个人主页 <span aria-hidden="true">↗</span></a><div>配置受保护 · 看板公开</div></div>
+    <div class="sidebar-bottom"><a href="/jenkins/" target="_blank" rel="noopener">Jenkins 控制台 <span aria-hidden="true">↗</span></a><a href="/">返回个人主页 <span aria-hidden="true">↗</span></a><div>查看公开 · 修改需口令</div></div>
   </aside>
   <div class="workspace">
     <header class="topbar"><div class="breadcrumb">质量管理 <span>/</span> <strong id="current-section">工作台</strong></div><div class="topbar-meta"><span class="access-badge">免登录访问</span><span>北京时间 UTC+8</span></div></header>
@@ -36,11 +37,23 @@
         <section class="panel"><div class="panel-head"><h2>最近执行</h2><a href="#/reports">全部记录 →</a></div><div class="table-wrap"><table><thead><tr><th>执行时间（北京时间）</th><th>结果</th><th>通过 / 总数</th><th>失败</th><th>执行来源</th><th>Jenkins 构建</th><th class="right">操作</th></tr></thead><tbody id="recent-body"><tr><td colspan="7" class="empty">正在读取执行记录…</td></tr></tbody></table></div></section>
       </section>
       <section id="page-tasks" class="page hidden">
-        <div class="page-header"><div><h1>巡检任务</h1><p>查看当前持久化检查配置，由 Jenkins Pipeline 统一执行</p></div><button class="button" data-refresh>刷新数据</button></div>
-        <section class="panel task-panel"><div class="task-heading"><div><span class="type-label">HTTP 冒烟</span><h2>站点 HTTP 冒烟巡检</h2><p>内置 7 项检查已保留；新增、编辑与启停通过独立的 SSH 隧道管理入口完成。</p></div><button class="button primary" data-run>立即执行</button></div><dl class="description-grid"><div><dt>任务标识</dt><dd><code>site-http-smoke</code></dd></div><div><dt>执行引擎</dt><dd>Jenkins Pipeline</dd></div><div><dt>定时规则</dt><dd>每天 09:00 · Asia/Shanghai</dd></div><div><dt>最近完成时间</dt><dd id="task-latest-time">—</dd></div><div><dt>检查方式</dt><dd>HTTP GET · 状态码 / 正文断言</dd></div><div><dt>最近结果</dt><dd id="task-latest-status">—</dd></div></dl><div class="task-foot"><a href="/jenkins/job/site-http-smoke/" target="_blank" rel="noopener">在 Jenkins 查看任务 ↗</a><span class="muted">Jenkins 仍需单独登录</span></div></section>
-        <section class="panel"><div class="panel-head"><h2>当前检查配置</h2><span class="muted" id="task-config-count">保存后于下一轮生效</span></div><div class="table-wrap"><table><thead><tr><th>检查项 / 版本</th><th>方法 / 地址</th><th>断言规则</th><th>超时</th><th class="right">配置状态</th></tr></thead><tbody id="task-checks-body"><tr><td colspan="5" class="empty">正在读取…</td></tr></tbody></table></div></section>
-        <div class="notice">看板免登录，配置修改仅限本机管理端；公开访客不能新增、编辑或启停检查。报告详情保留执行时快照，不受后续配置影响。</div>
-        <details class="panel access-guide"><summary>如何安全管理任务配置</summary><div>在自己的电脑终端建立 SSH 隧道（使用原有服务器 SSH 登录方式）：<pre>ssh -N -L 18766:127.0.0.1:8766 root@8.146.206.64</pre>隧道连接后打开 <a href="http://127.0.0.1:18766/" target="_blank" rel="noopener">http://127.0.0.1:18766/</a>。配置端只监听服务器回环地址，不增加公网登录密码。</div></details>
+        <div class="page-header"><div><h1>巡检任务</h1><p>查看、新建、编辑和启停检查。查看不需要登录；保存配置需要与发布相同的口令。</p></div><div class="actions"><button class="button" data-refresh>刷新数据</button><button class="button primary" id="task-create" type="button">新建检查</button></div></div>
+        <div id="task-message" class="notice hidden" role="status"></div>
+        <section class="panel task-panel"><div class="task-heading"><div><span class="type-label">HTTP 冒烟</span><h2>站点 HTTP 冒烟巡检</h2><p>内置 7 项检查保留。可以调整规则或启停；内置目标地址固定，其他地址请新建检查。</p></div><button class="button primary" data-run>立即执行</button></div><dl class="description-grid"><div><dt>任务标识</dt><dd><code>site-http-smoke</code></dd></div><div><dt>执行引擎</dt><dd>Jenkins Pipeline</dd></div><div><dt>定时规则</dt><dd>每天 09:00 · Asia/Shanghai</dd></div><div><dt>最近完成时间</dt><dd id="task-latest-time">—</dd></div><div><dt>检查方式</dt><dd>HTTP GET · 状态码 / 正文断言</dd></div><div><dt>最近结果</dt><dd id="task-latest-status">—</dd></div></dl><div class="task-foot"><a href="/jenkins/job/site-http-smoke/" target="_blank" rel="noopener">在 Jenkins 查看任务 ↗</a><span class="muted">Jenkins 仍需单独登录</span></div></section>
+        <section id="task-editor" class="panel hidden"><div class="panel-head"><h2 id="task-editor-title">新建检查</h2><button class="button small" id="task-cancel" type="button">取消</button></div>
+          <form id="task-form" class="editor-form" autocomplete="off">
+            <label>检查名称<input id="task-name" name="name" maxlength="80" required></label>
+            <label class="wide">请求地址<input id="task-url" name="url" maxlength="2048" required><span class="muted" id="task-url-help">只支持公开 HTTP:80 / HTTPS:443，不允许查询参数或凭证。</span></label>
+            <label>请求方法<select id="task-method" name="method"><option>GET</option><option>HEAD</option></select></label>
+            <label>预期状态码<input id="task-codes" name="codes" required value="200"><span class="muted">200–599，最多 8 个，用逗号分隔。</span></label>
+            <label>超时（秒）<input id="task-timeout" name="timeout" type="number" min="1" max="15" step="1" value="10" required></label>
+            <label class="wide">响应内容断言（可选）<textarea id="task-contains" name="contains" maxlength="500" rows="3"></textarea></label>
+            <label class="check"><input id="task-enabled" name="enabled" type="checkbox" checked> 启用此检查</label>
+            <div class="wide actions"><button id="task-save" class="button primary" type="submit">保存配置</button><span class="muted">最多 30 项，最多启用 15 项，启用项超时总预算不超过 120 秒。保存后下一轮生效。</span></div>
+          </form>
+        </section>
+        <section class="panel"><div class="panel-head"><h2>当前检查配置</h2><span class="muted" id="task-config-count">保存后于下一轮生效</span></div><div class="table-wrap"><table><thead><tr><th>检查项 / 版本</th><th>方法 / 地址</th><th>断言规则</th><th>超时</th><th>配置状态</th><th class="right">操作</th></tr></thead><tbody id="task-checks-body"><tr><td colspan="6" class="empty">正在读取…</td></tr></tbody></table></div></section>
+        <div class="notice">查看不需要登录。新建、编辑和启停提交口令，由服务器核对。报告详情保留执行时快照，不受后续配置影响。请勿在地址或断言中填写口令。本机管理入口仍可操作同一份配置。</div>
       </section>
       <section id="page-reports" class="page hidden">
         <div class="page-header"><div><h1>报告与日志</h1><p>查询历史执行结果，追溯失败原因与 HTTP 检查日志</p></div><button class="button" data-refresh>刷新数据</button></div>
@@ -50,6 +63,23 @@
         <div class="page-header"><div><h1>失败与恢复</h1><p>仅记录状态变化，连续相同结果自动去重</p></div><button class="button" data-refresh>刷新数据</button></div>
         <div class="notice mail-notice"><strong id="mail-status-label">邮件通知：读取状态中</strong><p id="mail-status-reason">发信服务未配置前不会发送邮件。</p><p id="mail-status-counts" class="muted"></p><p class="muted">启用或重新启用时以已有事件为基线，不补发历史；只通知此后新故障及其恢复。“已发送”表示 SMTP 已接收，不等同于收件箱送达。</p></div>
         <section class="panel"><div class="panel-head"><h2>状态变更记录</h2><span class="muted">最近 100 条</span></div><div class="table-wrap"><table><thead><tr><th>时间（北京时间）</th><th>事件</th><th>检查项</th><th>状态码 / 原因</th><th>邮件状态</th><th>投递记录</th><th class="right">关联报告</th></tr></thead><tbody id="events-body"><tr><td colspan="7" class="empty">正在读取站内事件…</td></tr></tbody></table></div></section>
+      </section>
+      <section id="page-releases" class="page hidden">
+        <div class="page-header"><div><h1>发布记录</h1><p id="release-lead">记录前端或后端发到本服务器的结果。查看不需要登录；发布、回滚、刷新结果和标记未确认需要发布口令。</p></div><button class="button" data-refresh>刷新数据</button></div>
+        <div id="release-message" class="notice hidden" role="status"></div>
+        <div id="release-summary" class="summary-line"></div>
+        <section class="panel"><div class="panel-head"><h2>新的发布</h2><span class="muted" id="release-host">目标主机</span></div>
+          <form id="release-form" class="editor-form" autocomplete="off">
+            <label>服务<select id="release-service" name="service"><option value="frontend">前端</option><option value="backend">后端</option></select></label>
+            <label>操作者<input id="release-actor" name="actor" maxlength="40" autocomplete="name"></label>
+            <label>版本<input id="release-version" name="version" maxlength="64" autocomplete="off"></label>
+            <label>提交 SHA<input id="release-commit" name="commit" maxlength="40" autocomplete="off" spellcheck="false"></label>
+            <label>制品标识<input id="release-artifact" name="artifact" maxlength="128" autocomplete="off"></label>
+            <div class="wide actions"><button class="button primary" id="release-submit" type="submit">发布到本服务器</button></div>
+          </form>
+        </section>
+        <section class="panel"><div class="panel-head"><div><h2>发布到本服务器</h2><span class="muted" id="release-count">正在读取</span></div></div><div class="table-wrap"><table><thead><tr><th>时间（北京时间）</th><th>服务</th><th>操作者</th><th>版本 / 提交 / 制品</th><th>状态</th><th>结果</th><th>操作</th></tr></thead><tbody id="release-body"><tr><td colspan="7" class="empty">正在读取发布记录…</td></tr></tbody></table></div></section>
+        <p class="muted">本机管理入口仍可操作同一份记录。口令只在点击发布、回滚、刷新结果或标记未确认时提交，由服务器核对。</p>
       </section>
       <section id="page-report" class="page hidden">
         <a href="#/reports" class="back-link">← 返回报告列表</a>
@@ -63,5 +93,14 @@
 </div>
 <div id="run-status" class="run-status hidden" role="status" aria-live="polite"></div>
 <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
-<script src="./app.js?v=4"></script>
+<div id="release-gate" class="gate hidden" role="dialog" aria-modal="true" aria-labelledby="release-gate-title" aria-hidden="true">
+  <form id="release-gate-form" class="gate-card" autocomplete="off">
+    <h2 id="release-gate-title">操作口令</h2>
+    <p id="release-gate-text">该操作需要发布口令。口令只发到服务器核对，页面不保存。</p>
+    <label for="release-gate-password">口令<input id="release-gate-password" type="password" autocomplete="current-password"></label>
+    <p id="release-gate-error" class="notice error hidden"></p>
+    <div class="actions"><button type="button" class="button" id="release-gate-cancel">取消</button><button type="submit" class="button primary">确认</button></div>
+  </form>
+</div>
+<script src="./app.js?v=6"></script>
 </body></html>
