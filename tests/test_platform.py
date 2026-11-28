@@ -160,8 +160,16 @@ class APITests(Base):
       self.assertEqual(code,expected,(path,raw[:100]));return json.loads(raw) if path.startswith('/api') or path.startswith('/qa/api') else raw
     try:
       req(pub,'/qa/api/tasks',200);req(pub,'/qa/api/events',200)
-      for path in ['/qa/api/tasks','/qa/api/tasks/home','/qa/admin/api/tasks','/qa/api/internal/run']:
-        req(pub,path,404,payload(),{'X-QA-Admin':'1','Host':'localhost'})
+      old_password=os.environ.pop('RELEASE_PUBLISH_PASSWORD',None)
+      try:
+        for path in ['/qa/api/tasks','/qa/api/tasks/home']:
+          denied=req(pub,path,403,payload(),{'X-QA-Admin':'1','Host':'localhost'})
+          self.assertIn(denied['error'],('发布口令未配置，未执行操作','口令不正确'))
+        self.assertEqual(len(req(pub,'/qa/api/tasks',200)['data']),7)
+        for path in ['/qa/admin/api/tasks','/qa/api/internal/run']:
+          req(pub,path,404,payload(),{'X-QA-Admin':'1','Host':'localhost'})
+      finally:
+        if old_password is not None:os.environ['RELEASE_PUBLISH_PASSWORD']=old_password
       for path in ['/qa/data/platform.db','/qa/data/secret.env','/qa/admin.py','/qa/admin-static/app.js']:req(pub,path,404)
       req(adm,'/api/tasks',403,headers={'Host':'attacker.example'})
       req(adm,'/api/tasks',403,payload(),{'X-QA-Admin':'1','Origin':'https://attacker.example'})

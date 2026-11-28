@@ -38,7 +38,7 @@
 | `RELEASE_INSPECT_AFTER_PUBLISH` | `1`（默认）在终态后跑现有巡检；`0` 则不跑 |
 | `RELEASE_DB_PATH` | 可选，发布库路径。默认 `data/release_console.db` |
 | `RELEASE_SECRET_FILE` | 可选，秘密文件路径。默认 `data/secret.env` |
-| `RELEASE_PUBLISH_PASSWORD` | 公开看板发布、回滚、刷新结果、标记未确认的口令。只放在 `data/secret.env` 或进程环境。未设置时这些操作失败且不写记录。不要写进示例文件、页面或测试 |
+| `RELEASE_PUBLISH_PASSWORD` | 公开看板发布、回滚、刷新结果、标记未确认，以及新建、编辑、启停检查的口令。只放在 `data/secret.env` 或进程环境。未设置时这些操作失败且不改数据。不要写进示例文件、页面或测试 |
 
 管理端不检查这道口令。公开接口只从 JSON 正文读取口令，不接受查询字符串，也不会把口令写进响应、页面或请求日志。
 

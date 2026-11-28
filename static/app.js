@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { overview: null, reports: [], page: 1, pageSize: 10, detail: null, running: false, refreshVersion: 0, releases: null, releaseBusy: false };
+  const state = { overview: null, reports: [], page: 1, pageSize: 10, detail: null, running: false, refreshVersion: 0, releases: null, releaseBusy: false, tasks: [], taskEditing: null, taskBusy: false };
   const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const stamp = value => value ? String(value).replace('T',' ').replace(/\+08:00$/, '') : '—';
   const duration = value => value == null ? '—' : Number(value) === 0 ? '< 1 s' : Number(value) < 1000 ? value + ' ms' : (Number(value) / 1000).toFixed(1) + ' s';
@@ -69,8 +69,9 @@
     $('task-latest-time').textContent = latest ? stamp(latest.finished_at) : '尚未执行';
     $('task-latest-status').innerHTML = latest ? badge(latest.status) : '—';
     const configured = data.tasks || [];
+    state.tasks = configured;
     $('task-config-count').textContent = '共 '+configured.length+' 项 · 启用 '+configured.filter(t=>t.enabled).length+' 项';
-    $('task-checks-body').innerHTML = configured.map(t => '<tr><td>'+esc(t.name)+'<div class="row-sub mono">v'+esc(t.revision)+(t.builtin?' · 内置':' · 自建')+'</div></td><td class="cell-wrap"><span class="mono">'+esc(t.method)+'</span><div class="row-sub">'+esc(t.url)+'</div></td><td class="cell-wrap">HTTP '+t.expected_status.map(esc).join(', ')+(t.contains?'<div class="row-sub">正文包含：'+esc(t.contains)+'</div>':'')+'</td><td>'+esc(t.timeout_sec)+' s</td><td class="right"><span class="'+(t.enabled?'task-enabled':'task-disabled')+'">'+(t.enabled?'已启用':'已停用')+'</span></td></tr>').join('') || '<tr><td colspan="5" class="empty">暂无配置</td></tr>';
+    $('task-checks-body').innerHTML = configured.map(t => '<tr><td>'+esc(t.name)+'<div class="row-sub mono">'+esc(t.id)+(t.builtin?' · 内置':' · 自建')+' · v'+esc(t.revision)+'</div></td><td class="cell-wrap"><span class="mono">'+esc(t.method)+'</span><div class="row-sub">'+esc(t.url)+'</div></td><td class="cell-wrap">HTTP '+t.expected_status.map(esc).join(', ')+(t.contains?'<div class="row-sub">正文包含：'+esc(t.contains)+'</div>':'')+'</td><td>'+esc(t.timeout_sec)+' s</td><td><span class="'+(t.enabled?'task-enabled':'task-disabled')+'">'+(t.enabled?'已启用':'已停用')+'</span></td><td class="right"><div class="row-actions"><button type="button" class="link-button" data-task-edit="'+esc(t.id)+'">编辑</button><button type="button" class="link-button" data-task-toggle="'+esc(t.id)+'">'+(t.enabled?'停用':'启用')+'</button></div></td></tr>').join('') || '<tr><td colspan="6" class="empty">暂无配置</td></tr>';
     $('last-updated').textContent = '数据更新时间 '+stamp(data.server_time)+'（北京时间）';
   }
   function renderReports() {
@@ -177,7 +178,7 @@
       const onSubmit = event => {
         event.preventDefault();
         const value = input.value; input.value = '';
-        if (!value) { errorBox.textContent = '请输入发布口令'; errorBox.classList.remove('hidden'); return; }
+        if (!value) { errorBox.textContent = '请输入操作口令'; errorBox.classList.remove('hidden'); return; }
         finish(value);
       };
       const onCancel = () => finish(null);
@@ -248,7 +249,85 @@
   $('report-filter').addEventListener('change', () => {state.page=1;renderReports();});
   $('prev-page').addEventListener('click', () => {state.page--;renderReports();});
   $('next-page').addEventListener('click', () => {state.page++;renderReports();});
+  function taskMessage(text, failed) {
+    const node = $('task-message');
+    node.textContent = text || '';
+    node.className = 'notice' + (failed ? ' error' : '') + (text ? '' : ' hidden');
+  }
+  function taskPayload(task, enabled) {
+    return {
+      name: task.name,
+      url: task.url,
+      method: task.method,
+      expected_status: task.expected_status,
+      contains: task.contains,
+      timeout_sec: task.timeout_sec,
+      enabled: enabled,
+      revision: task.revision
+    };
+  }
+  function openTaskEditor(task) {
+    state.taskEditing = task || null;
+    const form = $('task-form');
+    form.reset();
+    $('task-name').value = task ? task.name : '';
+    $('task-url').value = task ? task.url : '';
+    $('task-url').readOnly = !!(task && task.builtin);
+    $('task-method').value = task ? task.method : 'GET';
+    $('task-codes').value = task ? task.expected_status.join(', ') : '200';
+    $('task-timeout').value = task ? task.timeout_sec : 10;
+    $('task-contains').value = task ? task.contains : '';
+    $('task-enabled').checked = task ? task.enabled : true;
+    $('task-editor-title').textContent = task ? ('编辑检查 · ' + task.name) : '新建检查';
+    $('task-url-help').textContent = task && task.builtin ? '内置地址固定；如需其他地址请新建检查。' : '只支持公开 HTTP:80 / HTTPS:443，不允许查询参数或凭证。';
+    $('task-editor').classList.remove('hidden');
+    $('task-name').focus();
+  }
   $('failures-only').addEventListener('change',renderChecks);
+  $('task-create').addEventListener('click', () => openTaskEditor(null));
+  $('task-cancel').addEventListener('click', () => $('task-editor').classList.add('hidden'));
+  $('task-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (state.taskBusy) return;
+    const codes = $('task-codes').value.split(/[,，]/).map(item => item.trim()).filter(Boolean).map(Number);
+    if (!codes.length || codes.some(item => !Number.isInteger(item))) { taskMessage('状态码必须为整数。', true); return; }
+    const fields = {
+      name: $('task-name').value.trim(),
+      url: $('task-url').value.trim(),
+      method: $('task-method').value,
+      expected_status: codes,
+      contains: $('task-contains').value,
+      timeout_sec: parseInt($('task-timeout').value, 10),
+      enabled: $('task-enabled').checked
+    };
+    if (state.taskEditing) fields.revision = state.taskEditing.revision;
+    const path = '/tasks' + (state.taskEditing ? '/' + encodeURIComponent(state.taskEditing.id) : '');
+    state.taskBusy = true; $('task-save').disabled = true;
+    try {
+      const result = await releasePost(path, fields, state.taskEditing ? '保存这项检查。' : '新建检查。');
+      if (!result) return;
+      taskMessage('配置已保存。下一轮巡检使用新配置，已有报告保持原快照。', false);
+      $('task-editor').classList.add('hidden');
+      await refresh();
+    } catch (err) { taskMessage(err.message, true); }
+    finally { state.taskBusy = false; $('task-save').disabled = false; }
+  });
+  $('task-checks-body').addEventListener('click', async event => {
+    const edit = event.target.closest('[data-task-edit]');
+    const toggle = event.target.closest('[data-task-toggle]');
+    if (edit) { openTaskEditor(state.tasks.find(task => task.id === edit.getAttribute('data-task-edit'))); return; }
+    if (!toggle || state.taskBusy) return;
+    const task = state.tasks.find(item => item.id === toggle.getAttribute('data-task-toggle'));
+    if (!task) return;
+    state.taskBusy = true; toggle.disabled = true;
+    try {
+      const result = await releasePost('/tasks/' + encodeURIComponent(task.id), taskPayload(task, !task.enabled), task.enabled ? '停用这项检查。' : '启用这项检查。');
+      if (!result) return;
+      taskMessage('状态已保存，将在下一轮巡检生效。', false);
+      await refresh();
+    } catch (err) { taskMessage(err.message, true); }
+    finally { state.taskBusy = false; }
+  });
   $('release-service').addEventListener('change', () => { if (state.releases) renderReleases(); });
   $('release-form').addEventListener('submit', async event => {
     event.preventDefault();

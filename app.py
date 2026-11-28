@@ -33,6 +33,9 @@ PUBLIC_PREFIX = "/qa"
 TRIGGER_LOCK = threading.Lock()
 LAST_TRIGGER = 0
 TRIGGER_COOLDOWN = 60
+_TASK_POST = re.compile(
+    r"^/api/tasks(?:/(custom-[a-f0-9]{12}|home|resume|ops-hub|ai-test|games|qa-health|jenkins-login))?$"
+)
 
 
 def _now_shanghai():
@@ -384,11 +387,65 @@ class Handler(BaseHTTPRequestHandler):
             return
         board.handle_post(self, path)
 
+    def _config_post(self, path):
+        match = _TASK_POST.match(path)
+        if not match:
+            self._send(404, {"ok": False, "error": "接口不存在"})
+            return
+        if (self.headers.get("Content-Type") or "").split(";", 1)[0] != "application/json":
+            self._send(415, {"ok": False, "error": "仅接受 JSON 请求"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0 or length > 8192:
+            self._send(413, {"ok": False, "error": "请求体上限为 8 KiB"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeError, ValueError):
+            self._send(400, {"ok": False, "error": "请求体必须是 JSON"})
+            return
+        if not isinstance(body, dict):
+            self._send(400, {"ok": False, "error": "请求体必须是 JSON 对象"})
+            return
+        provided = body.pop("password", None)
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host") or ""
+        try:
+            invalid_origin = bool(origin and urlparse(origin).netloc != host)
+        except ValueError:
+            invalid_origin = True
+        if invalid_origin:
+            self._send(403, {"ok": False, "error": "不接受跨站操作"})
+            return
+        board = self._release_module()
+        if board is None:
+            self._send(503, {"ok": False, "error": "配置功能未启用，未修改检查"})
+            return
+        try:
+            settings = board.load_settings()
+            board.require_password(provided, settings)
+            task = core.save_task(body, match.group(1))
+            self._send(200, {"ok": True, "data": board._redact(task, settings)})
+        except board.BoardError as err:
+            self._send(err.status, {"ok": False, "error": board._scrub(str(err), board.load_settings())})
+        except core.ValidationError as err:
+            self._send(400, {"ok": False, "error": board._scrub(str(err), board.load_settings())[:300]})
+        except Exception:
+            print("task config error", flush=True)
+            self._send(500, {"ok": False, "error": "配置保存失败，请检查服务器服务日志"})
+
     def do_POST(self):
         global LAST_TRIGGER
         path, _query = self._path()
         if path == "/api/releases" or path.startswith("/api/releases/"):
             self._release_post(path)
+            return
+        if path == "/api/tasks" or path.startswith("/api/tasks/"):
+            self._config_post(path)
             return
         if path != "/api/runs":
             # Login/logout and the old internal runner are deliberately not public APIs.
