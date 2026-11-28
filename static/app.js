@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { overview: null, reports: [], page: 1, pageSize: 10, detail: null, running: false, refreshVersion: 0 };
+  const state = { overview: null, reports: [], page: 1, pageSize: 10, detail: null, running: false, refreshVersion: 0, releases: null, releaseBusy: false };
   const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const stamp = value => value ? String(value).replace('T',' ').replace(/\+08:00$/, '') : '—';
   const duration = value => value == null ? '—' : Number(value) === 0 ? '< 1 s' : Number(value) < 1000 ? value + ' ms' : (Number(value) / 1000).toFixed(1) + ' s';
@@ -36,14 +36,14 @@
     return body;
   }
   function currentRoute() {
-    const match = location.hash.match(/^#\/(dashboard|tasks|reports|events)(?:\/([^/]+))?$/);
+    const match = location.hash.match(/^#\/(dashboard|tasks|reports|events|releases)(?:\/([^/]+))?$/);
     return match ? {name:match[1],id:match[2]} : {name:'dashboard'};
   }
   function setPage(name) {
     document.querySelectorAll('.page').forEach(node => node.classList.toggle('hidden', node.id !== 'page-' + name));
     document.querySelectorAll('[data-nav]').forEach(node => node.classList.toggle('active', node.dataset.nav === (name === 'report' ? 'reports' : name)));
     document.querySelectorAll('[data-nav]').forEach(node => node.classList.contains('active') ? node.setAttribute('aria-current','page') : node.removeAttribute('aria-current'));
-    $('current-section').textContent = ({dashboard:'工作台',tasks:'巡检任务',reports:'报告与日志',report:'报告详情',events:'失败与恢复'})[name] || '工作台';
+    $('current-section').textContent = ({dashboard:'工作台',tasks:'巡检任务',reports:'报告与日志',report:'报告详情',events:'失败与恢复',releases:'发布记录'})[name] || '工作台';
     document.title = $('current-section').textContent + ' · 巡检平台';
   }
   function renderOverview(data) {
@@ -118,11 +118,90 @@
       return '<tr><td class="timestamp">'+esc(stamp(e.occurred_at))+'</td><td><span class="badge '+(e.kind==='failure'?'fail':'pass')+'">'+(e.kind==='failure'?'失败':'恢复')+'</span></td><td>'+esc(e.task_name)+'<div class="row-sub mono">'+esc(e.task_id)+'</div></td><td class="cell-wrap">HTTP '+esc(e.status_code)+'<div class="row-sub">'+esc(e.message)+'</div></td><td><span class="badge '+cls+'">'+esc(n.label)+'</span>'+(n.failure_event_id?'<div class="row-sub">关联故障 #'+esc(n.failure_event_id)+'</div>':'')+'</td><td class="cell-wrap">'+esc(detail)+(n.reason?'<div class="row-sub">'+esc(n.reason)+'</div>':'')+'</td><td class="right"><a href="'+reportUrl(e.run_id)+'">查看报告</a></td></tr>';
     }).join('') || '<tr><td colspan="7" class="empty">暂无失败或恢复事件。正常通过不产生告警；未配置发信服务时不会发送邮件。</td></tr>';
   }
+  const releaseLabels = {frontend:'前端', backend:'后端', deploy:'发布', rollback:'回滚'};
+  const releaseStates = {deploying:['wait','发布中'], succeeded:['pass','已成功'], failed:['fail','未成功'], rolled_back:['back','已回滚']};
+  const inspectLabels = {disabled:'巡检未启用', skipped:'未启动巡检', error:'巡检未启动', passed:'巡检通过', failed:'巡检失败', unknown:'巡检结果未知'};
+  const releaseWhen = value => stamp(value).replace(/\.\d+/, '');
+  function releaseMessage(text, failed) {
+    const node = $('release-message');
+    node.textContent = text || '';
+    node.className = 'notice' + (failed ? ' error' : '') + (text ? '' : ' hidden');
+  }
+  function releaseStateBadge(status) {
+    const item = releaseStates[status] || ['unknown', status || '未知'];
+    return '<span class="badge '+item[0]+'">'+esc(item[1])+'</span>';
+  }
+  function renderReleases() {
+    const snapshot = state.releases || {services:{}, records:[], unavailable:true};
+    const services = snapshot.services || {};
+    $('release-host').textContent = snapshot.host_valid ? ('目标 ' + snapshot.host) : (snapshot.unavailable ? '发布记录暂时无法读取' : '主机配置无效');
+    $('release-lead').textContent = '记录前端或后端发到 ' + (snapshot.host || '本服务器') + ' 的结果。查看不需要登录；发布、回滚、刷新结果和标记未确认需要发布口令。';
+    $('release-summary').innerHTML = ['frontend','backend'].map(key => {
+      const item = services[key] || {label:releaseLabels[key], wired:false, locked:false, current_id:''};
+      const current = (snapshot.records || []).find(row => row.id === item.current_id);
+      const detail = current ? (current.version || current.commit_sha || current.artifact || current.id) : '尚无生效发布';
+      const wired = item.wired ? '发布任务已配置' : '发布任务未配置';
+      return '<article><span class="muted">'+esc(item.label || releaseLabels[key])+' · '+esc(wired)+(item.locked ? ' · 发布进行中' : '')+'</span><strong>'+esc(detail)+'</strong></article>';
+    }).join('');
+    const rows = snapshot.records || [];
+    $('release-count').textContent = snapshot.unavailable ? '暂时无法读取' : (rows.length ? ('共 '+rows.length+' 条') : '尚无记录');
+    $('release-body').innerHTML = rows.length ? rows.map(row => {
+      const identity = [row.version, row.commit_sha, row.artifact].filter(Boolean).map(esc).join('<br>') || '—';
+      const inspectLabel = inspectLabels[row.inspect_status] || row.inspect_status || '';
+      const build = /^https?:\/\//.test(row.jenkins_build_url || '') ? '<a href="'+esc(row.jenkins_build_url)+'" rel="noopener noreferrer">Jenkins 构建</a>' : '';
+      const inspect = row.inspect_run_id ? ('巡检 '+esc(row.inspect_run_id)+(inspectLabel ? ' · '+esc(inspectLabel) : '')) : esc(inspectLabel);
+      const service = services[row.service] || {};
+      const buttons = [];
+      if (row.state === 'deploying') {
+        buttons.push('<button type="button" class="link-button" data-release-refresh="'+esc(row.id)+'">刷新结果</button>');
+        if (row.can_abandon) buttons.push('<button type="button" class="link-button" data-release-abandon="'+esc(row.id)+'">标记未确认</button>');
+      }
+      if (service.current_id === row.id && service.can_rollback) buttons.push('<button type="button" class="link-button" data-release-rollback="'+esc(row.id)+'">回滚到上一成功发布</button>');
+      return '<tr><td class="timestamp">'+esc(releaseWhen(row.created_at))+'<div class="row-sub">'+esc(releaseLabels[row.action] || row.action)+'</div></td><td><span class="service-tag">'+esc(releaseLabels[row.service] || row.service)+'</span></td><td>'+esc(row.actor)+'</td><td class="cell-wrap mono">'+identity+'</td><td>'+releaseStateBadge(row.state)+'</td><td class="cell-wrap">'+esc(row.result_message || '')+'<div class="row-sub">'+build+(inspect ? ' '+inspect : '')+'</div></td><td><div class="row-actions">'+(buttons.join('') || '<span class="muted">—</span>')+'</div></td></tr>';
+    }).join('') : '<tr><td colspan="7" class="empty">'+(snapshot.unavailable ? '发布记录暂时无法读取。' : '尚无发布到本服务器的记录。')+'</td></tr>';
+    const selected = $('release-service').value;
+    $('release-submit').disabled = state.releaseBusy || !!(services[selected] && services[selected].locked);
+  }
+  function askPassword(purpose) {
+    if (askPassword.pending) return Promise.resolve(null);
+    const gate = $('release-gate'), input = $('release-gate-password'), errorBox = $('release-gate-error');
+    $('release-gate-text').textContent = purpose + '口令只发到服务器核对，页面不保存。';
+    errorBox.textContent = ''; errorBox.classList.add('hidden'); input.value = '';
+    gate.classList.remove('hidden'); gate.setAttribute('aria-hidden','false'); input.focus();
+    askPassword.pending = new Promise(resolve => {
+      const finish = value => {
+        input.value = ''; gate.classList.add('hidden'); gate.setAttribute('aria-hidden','true');
+        form.removeEventListener('submit', onSubmit); cancel.removeEventListener('click', onCancel); document.removeEventListener('keydown', onKey);
+        askPassword.pending = null; resolve(value);
+      };
+      const onSubmit = event => {
+        event.preventDefault();
+        const value = input.value; input.value = '';
+        if (!value) { errorBox.textContent = '请输入发布口令'; errorBox.classList.remove('hidden'); return; }
+        finish(value);
+      };
+      const onCancel = () => finish(null);
+      const onKey = event => { if (event.key === 'Escape') finish(null); };
+      const form = $('release-gate-form'), cancel = $('release-gate-cancel');
+      form.addEventListener('submit', onSubmit); cancel.addEventListener('click', onCancel); document.addEventListener('keydown', onKey);
+    });
+    return askPassword.pending;
+  }
+  async function releasePost(path, fields, purpose) {
+    const password = await askPassword(purpose);
+    if (!password) return null;
+    const body = Object.assign({}, fields, {password: password});
+    try { return await api(path, {method:'POST', body:JSON.stringify(body)}); }
+    finally { body.password = ''; }
+  }
   async function refresh() {
     const version = ++state.refreshVersion; error('');
     const route = currentRoute(); setPage(route.name === 'reports' && route.id ? 'report' : route.name);
     try {
-      if(route.name === 'events') {
+      if(route.name === 'releases') {
+        const data = await api('/releases'); if(version !== state.refreshVersion) return;
+        state.releases = data.data; renderReleases();
+      } else if(route.name === 'events') {
         const events = await api('/events'); if(version !== state.refreshVersion) return; renderEvents(events.data,events.mail);
       } else if(route.name === 'reports' && route.id) {
         const res = await api('/reports/'+encodeURIComponent(route.id));
@@ -170,6 +249,47 @@
   $('prev-page').addEventListener('click', () => {state.page--;renderReports();});
   $('next-page').addEventListener('click', () => {state.page++;renderReports();});
   $('failures-only').addEventListener('change',renderChecks);
+  $('release-service').addEventListener('change', () => { if (state.releases) renderReleases(); });
+  $('release-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (state.releaseBusy) return;
+    const fields = {
+      service: $('release-service').value,
+      actor: $('release-actor').value.trim(),
+      version: $('release-version').value.trim(),
+      commit: $('release-commit').value.trim(),
+      artifact: $('release-artifact').value.trim()
+    };
+    if (!fields.actor || (!fields.version && !fields.commit)) { releaseMessage('请填写操作者，以及版本或提交 SHA。', true); return; }
+    state.releaseBusy = true; if (state.releases) renderReleases();
+    try {
+      const result = await releasePost('/releases', fields, '发布到本服务器。');
+      if (!result) return;
+      releaseMessage('发布任务已提交。在 Jenkins 给出结果前，状态保持为发布中。', false);
+      await refresh();
+    } catch (err) { releaseMessage(err.message, true); try { await refresh(); } catch (loadErr) { error(loadErr.message); } }
+    finally { state.releaseBusy = false; if (state.releases) renderReleases(); }
+  });
+  $('release-body').addEventListener('click', async event => {
+    const button = event.target.closest('[data-release-refresh],[data-release-rollback],[data-release-abandon]');
+    if (!button || state.releaseBusy) return;
+    const id = button.getAttribute('data-release-refresh') || button.getAttribute('data-release-rollback') || button.getAttribute('data-release-abandon');
+    const kind = button.hasAttribute('data-release-refresh') ? 'refresh' : button.hasAttribute('data-release-rollback') ? 'rollback' : 'abandon';
+    const actor = $('release-actor').value.trim();
+    if (kind !== 'refresh' && !actor) { releaseMessage('请先填写操作者。', true); return; }
+    if (kind === 'rollback' && !window.confirm('确认回滚该服务到上一次成功发布？')) return;
+    if (kind === 'abandon' && !window.confirm('只有在 Jenkins 没有对应构建时才应标记未确认。确认继续？')) return;
+    state.releaseBusy = true;
+    try {
+      const purpose = kind === 'refresh' ? '刷新发布结果。' : kind === 'rollback' ? '回滚到上一成功发布。' : '把未确认的发布标记为未发布。';
+      const fields = kind === 'refresh' ? {} : {actor: actor};
+      const result = await releasePost('/releases/' + encodeURIComponent(id) + '/' + kind, fields, purpose);
+      if (!result) return;
+      releaseMessage(kind === 'refresh' ? '已读取 Jenkins 结果。' : kind === 'rollback' ? '回滚任务已提交。' : '已标记为未确认。', false);
+      await refresh();
+    } catch (err) { releaseMessage(err.message, true); try { await refresh(); } catch (loadErr) { /* keep the action error */ } }
+    finally { state.releaseBusy = false; if (state.releases) renderReleases(); }
+  });
   window.addEventListener('hashchange', () => {$('failures-only').checked=false;refresh();});
   refresh();
 })();

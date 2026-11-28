@@ -426,11 +426,12 @@ class ReleaseConsoleTests(unittest.TestCase):
             self.assertNotIn("github.com", text)
             self.assertIn("UNFINISHED", text)
 
-    def test_public_app_has_no_publish_route(self):
+    def test_public_app_does_not_import_release_console(self):
         with open(os.path.join(SOURCE, "app.py"), encoding="utf-8") as handle:
             source = handle.read()
-        self.assertNotIn("/api/releases", source)
-        self.assertNotIn("release_console", source)
+        self.assertNotIn("import release_console", source)
+        self.assertNotIn("from release_console", source)
+        self.assertIn("/api/releases", source)
 
     def _remember_env(self, key, value):
         self._env.setdefault(key, os.environ.get(key))
@@ -492,7 +493,18 @@ class ReleaseConsoleTests(unittest.TestCase):
         for server in (public, private):
             threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            for path in ("/qa/api/releases", "/api/releases", "/qa/publish", "/publish"):
+            self._remember_env("RELEASE_PUBLISH_PASSWORD", None)
+            wrong = "wrong-%s" % os.urandom(8).hex()
+            for path in ("/qa/api/releases", "/api/releases"):
+                denied = self._http(public, path, 403, {
+                    "service": "frontend", "actor": "朱帅", "version": "1", "password": wrong,
+                }, {"X-QA-Admin": "1"})
+                self.assertIn("未执行", denied["error"])
+                self.assertNotIn(TOKEN, json.dumps(denied))
+                self.assertNotIn(wrong, json.dumps(denied))
+            self.assertEqual(self.store.list_all(), [])
+            self.assertEqual(self.fake.calls, [])
+            for path in ("/qa/publish", "/publish"):
                 self._http(public, path, 404, {"service": "frontend"}, {"X-QA-Admin": "1"})
             self._http(private, "/api/releases", 403, headers={"Host": "attacker.example"})
             self._http(private, "/api/releases", 403, {"service": "frontend"}, {"X-QA-Admin": "1", "Origin": "https://attacker.example"})

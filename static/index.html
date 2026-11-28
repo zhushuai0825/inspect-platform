@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#101d35">
   <title>巡检平台 · 质量控制台</title>
-  <link rel="stylesheet" href="./styles.css?v=4">
+  <link rel="stylesheet" href="./styles.css?v=5">
 </head>
 <body>
 <div class="shell">
@@ -16,6 +16,7 @@
       <a href="#/tasks" data-nav="tasks"><span class="nav-symbol" aria-hidden="true">02</span>巡检任务</a>
       <a href="#/reports" data-nav="reports"><span class="nav-symbol" aria-hidden="true">03</span>报告与日志</a>
       <a href="#/events" data-nav="events"><span class="nav-symbol" aria-hidden="true">04</span>失败与恢复</a>
+      <a href="#/releases" data-nav="releases"><span class="nav-symbol" aria-hidden="true">05</span>发布记录</a>
     </nav>
     <div class="sidebar-bottom"><a href="/jenkins/" target="_blank" rel="noopener">Jenkins 控制台 <span aria-hidden="true">↗</span></a><a href="/">返回个人主页 <span aria-hidden="true">↗</span></a><div>配置受保护 · 看板公开</div></div>
   </aside>
@@ -51,6 +52,23 @@
         <div class="notice mail-notice"><strong id="mail-status-label">邮件通知：读取状态中</strong><p id="mail-status-reason">发信服务未配置前不会发送邮件。</p><p id="mail-status-counts" class="muted"></p><p class="muted">启用或重新启用时以已有事件为基线，不补发历史；只通知此后新故障及其恢复。“已发送”表示 SMTP 已接收，不等同于收件箱送达。</p></div>
         <section class="panel"><div class="panel-head"><h2>状态变更记录</h2><span class="muted">最近 100 条</span></div><div class="table-wrap"><table><thead><tr><th>时间（北京时间）</th><th>事件</th><th>检查项</th><th>状态码 / 原因</th><th>邮件状态</th><th>投递记录</th><th class="right">关联报告</th></tr></thead><tbody id="events-body"><tr><td colspan="7" class="empty">正在读取站内事件…</td></tr></tbody></table></div></section>
       </section>
+      <section id="page-releases" class="page hidden">
+        <div class="page-header"><div><h1>发布记录</h1><p id="release-lead">记录前端或后端发到本服务器的结果。查看不需要登录；发布、回滚、刷新结果和标记未确认需要发布口令。</p></div><button class="button" data-refresh>刷新数据</button></div>
+        <div id="release-message" class="notice hidden" role="status"></div>
+        <div id="release-summary" class="summary-line"></div>
+        <section class="panel"><div class="panel-head"><h2>新的发布</h2><span class="muted" id="release-host">目标主机</span></div>
+          <form id="release-form" class="editor-form" autocomplete="off">
+            <label>服务<select id="release-service" name="service"><option value="frontend">前端</option><option value="backend">后端</option></select></label>
+            <label>操作者<input id="release-actor" name="actor" maxlength="40" autocomplete="name"></label>
+            <label>版本<input id="release-version" name="version" maxlength="64" autocomplete="off"></label>
+            <label>提交 SHA<input id="release-commit" name="commit" maxlength="40" autocomplete="off" spellcheck="false"></label>
+            <label>制品标识<input id="release-artifact" name="artifact" maxlength="128" autocomplete="off"></label>
+            <div class="wide actions"><button class="button primary" id="release-submit" type="submit">发布到本服务器</button></div>
+          </form>
+        </section>
+        <section class="panel"><div class="panel-head"><div><h2>发布到本服务器</h2><span class="muted" id="release-count">正在读取</span></div></div><div class="table-wrap"><table><thead><tr><th>时间（北京时间）</th><th>服务</th><th>操作者</th><th>版本 / 提交 / 制品</th><th>状态</th><th>结果</th><th>操作</th></tr></thead><tbody id="release-body"><tr><td colspan="7" class="empty">正在读取发布记录…</td></tr></tbody></table></div></section>
+        <p class="muted">本机管理入口仍可操作同一份记录。口令只在点击发布、回滚、刷新结果或标记未确认时提交，由服务器核对。</p>
+      </section>
       <section id="page-report" class="page hidden">
         <a href="#/reports" class="back-link">← 返回报告列表</a>
         <div class="page-header"><div><h1>巡检报告 <span id="report-badge"></span></h1><p id="report-id" class="mono"></p></div><a id="report-jenkins-link" class="button hidden" target="_blank" rel="noopener">Jenkins 构建日志 ↗</a></div>
@@ -63,5 +81,14 @@
 </div>
 <div id="run-status" class="run-status hidden" role="status" aria-live="polite"></div>
 <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
-<script src="./app.js?v=4"></script>
+<div id="release-gate" class="gate hidden" role="dialog" aria-modal="true" aria-labelledby="release-gate-title" aria-hidden="true">
+  <form id="release-gate-form" class="gate-card" autocomplete="off">
+    <h2 id="release-gate-title">发布口令</h2>
+    <p id="release-gate-text">该操作需要发布口令。口令只发到服务器核对，页面不保存。</p>
+    <label for="release-gate-password">口令<input id="release-gate-password" type="password" autocomplete="current-password"></label>
+    <p id="release-gate-error" class="notice error hidden"></p>
+    <div class="actions"><button type="button" class="button" id="release-gate-cancel">取消</button><button type="submit" class="button primary">确认</button></div>
+  </form>
+</div>
+<script src="./app.js?v=5"></script>
 </body></html>

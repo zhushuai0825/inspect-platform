@@ -238,7 +238,13 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "inspect-platform/1.0"
 
     def log_message(self, fmt, *args):
-        print("[%s] %s" % (_now_shanghai(), fmt % args))
+        try:
+            text = fmt % args
+        except Exception:
+            text = "request"
+        if "password=" in text.lower():
+            text = "request omitted because it included a password query"
+        print("[%s] %s" % (_now_shanghai(), text))
 
     def _path(self):
         parsed = urlparse(self.path)
@@ -345,13 +351,45 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, {"ok": True, "data": data})
                 return
+            if path == "/api/releases":
+                self._release_get()
+                return
             self._send(404, {"ok": False, "error": "接口不存在"})
             return
         self._static_file(path)
 
+    def _release_module(self):
+        # Loaded lazily so a release-module failure cannot stop the rest of the workbench.
+        try:
+            import publish_board
+        except Exception:
+            print("publish_board unavailable", flush=True)
+            return None
+        return publish_board
+
+    def _release_get(self):
+        board = self._release_module()
+        if board is None:
+            self._send(200, {"ok": True, "data": {
+                "host": "", "host_valid": False, "inspect_after_publish": False,
+                "unavailable": True, "services": {}, "records": [],
+            }})
+            return
+        board.handle_get(self)
+
+    def _release_post(self, path):
+        board = self._release_module()
+        if board is None:
+            self._send(503, {"ok": False, "error": "发布功能未启用，未执行操作"})
+            return
+        board.handle_post(self, path)
+
     def do_POST(self):
         global LAST_TRIGGER
         path, _query = self._path()
+        if path == "/api/releases" or path.startswith("/api/releases/"):
+            self._release_post(path)
+            return
         if path != "/api/runs":
             # Login/logout and the old internal runner are deliberately not public APIs.
             self._send(404, {"ok": False, "error": "接口不存在"})
